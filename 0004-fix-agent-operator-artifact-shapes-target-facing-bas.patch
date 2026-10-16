@@ -1,0 +1,898 @@
+From 72cec3f5a2708c3b01549b894c2b555caf5ec131 Mon Sep 17 00:00:00 2001
+From: Wolfram Huesken <woh@m18.io>
+Date: Thu, 15 Oct 2026 09:13:26 +0200
+Subject: [PATCH 4/5] fix(agent): operator artifact shapes, target-facing bash
+ progress, honest run labels
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Patches 8-10 of the local vigolium stack, on top of 77725f2a (patches 1-7 plus
+the re-apply guide) which sits on 82a92a92 (v0.5.3). Per-patch symptoms, root
+causes, anchors and recipes live in docs/development/local-agent-pipeline-patches.md;
+the config side (needed to reproduce behaviour, and not in git) is listed there
+under "Config side (not in git)".
+
+8. Artifact shapes — pkg/agent/autopilot_context.go
+   countEvidenceBackedFindings accepted only an array of objects or
+   {"findings":[...]}. The operator writes dismissed.json as a flat array of
+   ruled-out reasons (plain strings), so a complete run ended with
+   "failed to parse dismissed.json as findings artifact". Entries may now be any
+   JSON value: string entries count where no evidence check applies (the
+   dismissed artifact) and stay flagged as evidence-free in findings.json.
+   Test: TestCountEvidenceBackedFindingsAcceptsPlainStringEntries.
+
+9. Target-facing bash counts as progress — pkg/olium/autopilot/rotation.go,
+   pkg/olium/autopilot/autopilot.go
+   The stall detector's productiveTools is a static tool-name set, so an operator
+   that verifies through the shell (curl with a harvested session cookie,
+   replaying a captured request) looked stalled: two rotations at 12 turns then a
+   halt, with ~36 turns of real probing discarded. productiveCall now also counts
+   a bash call whose command names an HTTP client (curl/wget/httpie/httpx/hurl/
+   ncat/netcat) and an in-scope host; progressTargetHosts derives the hosts from
+   the target + scope and includes loopback aliases. EventToolExecEnd carries no
+   args, so the loop stashes ToolArgs at EventToolExecStart and decides at end.
+   Source reads, URL greps and `docker exec mysql` still count as no progress.
+   Tests: TestProductiveCall, TestProgressTargetHosts,
+   TestRunCountsTargetFacingBashAsProgress, TestRunStillStallsOnNonTargetBash.
+
+10. A finished run does not read as broken — pkg/cli/agent_session.go,
+    pkg/agent/autopilot_context.go
+    (a) A warned run keeps its warning list in the same field a failed run keeps
+        its error, and the session detail hard-coded an "Error" heading, so a
+        successful 7h45m run with 13 findings read as failed. runMessageLabel now
+        follows the status ("Warnings" vs "Error"), for parent and child runs.
+    (b) hasEvidence only accepted inlined evidence, so findings citing linked
+        HTTP records counted as evidence-free ("19 entries without evidence
+        references" for a run where 7 of the 19 had linked records). Non-empty
+        http_record_uuids / evidence_record_uuids now count, including []string.
+    Tests: TestRunMessageLabel, plus the reference-list cases in
+    TestHasEvidenceRecognisesWhiteboxProvenance. Against that run's real
+    artifact the counter went from count=6 / 19 unsupported to 13 / 12.
+
+Re-applying on a fresh clone
+  git format-patch 82a92a92..HEAD -o <dir>     # in this repo
+  cd <fresh clone> && git am <dir>/*.patch     # applies ce8fcf20, 77725f2a, this
+or: git cherry-pick ce8fcf20 77725f2a <this-commit>
+Then: make test-unit && make build, and apply the config-side settings from the
+guide. Verify a patch is present with the anchor greps in that guide's "Checking
+whether a newer release already has a fix" section.
+---
+ CHANGELOG.md                                  |   7 +
+ docs/agentic-scan/autopilot.md                |  19 ++-
+ .../local-agent-pipeline-patches.md           | 134 +++++++++++++--
+ pkg/agent/autopilot_context.go                |  48 ++++--
+ pkg/agent/autopilot_evidence_test.go          |  48 ++++++
+ pkg/cli/agent_session.go                      |  29 +++-
+ pkg/cli/agent_session_label_test.go           |  24 +++
+ pkg/olium/autopilot/autopilot.go              |  18 ++-
+ pkg/olium/autopilot/progress_test.go          | 153 ++++++++++++++++++
+ pkg/olium/autopilot/rotation.go               | 151 +++++++++++++++++
+ 10 files changed, 597 insertions(+), 34 deletions(-)
+ create mode 100644 pkg/cli/agent_session_label_test.go
+ create mode 100644 pkg/olium/autopilot/progress_test.go
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 590a7b8d..30696fbc 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -15,6 +15,13 @@ All notable changes to this project will be documented in this file.
+ - `findings.json` / `dismissed.json` were a model obligation: when the operator did not write them the run warned "artifact missing" even though the findings were in the database. They are now synthesized from the DB once verify-before-promote and triage have finished, so the artifact reflects the run's judged findings; operator-authored files still win.
+ - An invalid discovered auth session produced only "some discovered auth sessions were invalid and could not be repaired" — no names, no reasons — which sent the operator hunting for sessions that do not exist. The warning now names the dropped entries, their validation errors and the usable sessions; the repair failure is logged with its cause; and `auth_session_lookup` on an unknown name lists the configured sessions.
+ - `--project-name` that names no project was silently ignored on the autopilot and agent-query paths: the run wrote its findings into the Default Project and the post-run triage failed for want of a project UUID, with nothing in the log explaining why. Resolution errors are now propagated (`cannot scope this run to a project: ...`) instead of being discarded.
++- A run that finished with warnings printed its warning list under an `✖ Error` heading in `vigolium agent session`, so a successful 7h45m run with 13 findings read as broken. The heading now follows the status (`Warnings` vs `Error`).
++- The autopilot artifact check counted a finding as evidence-free unless it inlined a request/response body, so findings that cite linked HTTP records — the common shape — were reported as unsupported. Non-empty `http_record_uuids` / `evidence_record_uuids` now count as evidence references.
++- A `bash` turn that reaches the target with an HTTP client (`curl`, `wget`, `httpie`, `httpx`, `hurl`, `ncat`, `netcat`)
++  and names the run's target or a scope host now counts as progress for the autopilot stall detector, so shell-driven
++  probing — replaying a request, reusing a harvested session cookie — no longer reads as a stall and no longer stops
++  the run. Source reads, URL greps and `docker exec` database queries still count as no progress.
++- The autopilot artifact check rejected `dismissed.json` written as a flat array of strings — the shape the operator actually produces — and reported a complete run as degraded with `failed to parse dismissed.json as findings artifact`. Artifact entries may now be any JSON value: string entries count where no evidence check applies (the dismissed artifact) and are still flagged as evidence-free in `findings.json`.
+ 
+ ## [v0.5.3] - 2026-10-10
+ 
+diff --git a/docs/agentic-scan/autopilot.md b/docs/agentic-scan/autopilot.md
+index aed99d94..2271c1dd 100644
+--- a/docs/agentic-scan/autopilot.md
++++ b/docs/agentic-scan/autopilot.md
+@@ -287,13 +287,18 @@ the target or record a result count:
+ 
+ `run_native_scan`, `run_extension`, `run_module`, `browser_probe`, `web_fetch`,
+ `replay_request`, `send_raw_http`, `browser_auth`, `report_finding`,
+-`propose_candidate`.
+-
+-Everything else — `bash`, `read_file`, `grep`, `query_records`,
+-`list_findings`, `auth_session_lookup`, `update_plan`, `remember` — is
+-inspection or bookkeeping, so reading source, querying the target's database
+-through `bash`, or replaying a request by hand counts as *no* progress even when
+-it is exactly how a bug gets verified.
++`propose_candidate` — plus one derived case: a **`bash` turn that speaks HTTP to
++an in-scope host**, i.e. the command names an HTTP client (`curl`, `wget`,
++`httpie`, `httpx`, `hurl`, `ncat`, `netcat`) *and* the run's target or a scope
++host. That is how an operator replays a request or probes with a harvested
++session cookie from the shell, and it is target-facing work.
++
++Everything else — a `bash` turn that only reads source or greps for a URL, plus
++`read_file`, `grep`, `query_records`, `list_findings`, `auth_session_lookup`,
++`update_plan`, `remember`, and querying the target's database through
++`docker exec` — is inspection or bookkeeping, and counts as *no* progress even
++when it is exactly how a bug gets verified. For those investigation styles, widen
++the leash instead:
+ 
+ | Setting | Default | Effect |
+ | --- | --- | --- |
+diff --git a/docs/development/local-agent-pipeline-patches.md b/docs/development/local-agent-pipeline-patches.md
+index f512be26..d878249a 100644
+--- a/docs/development/local-agent-pipeline-patches.md
++++ b/docs/development/local-agent-pipeline-patches.md
+@@ -6,9 +6,9 @@ survive a rebase onto a newer release, and so it is obvious when a release has
+ made one redundant.
+ 
+ - Baseline: `82a92a92` (`v0.5.3` plus the earlier `agent.olium.max_turns` fix)
+-- Patch commit: `ce8fcf20` — *"Fixed some weird behaviour causing the scan to degrade"*
+-- This guide plus the two tests it adds (`pkg/cli/agent_autopilot_project_test.go`,
+-  `pkg/agent/autopilot_evidence_test.go`) ride in a follow-up commit on top of it.
++- Patch commits: `ce8fcf20` — *"Fixed some weird behaviour causing the scan to degrade"*
++  (code fixes) → `77725f2a` — *"test(agent): lock the pipeline fixes and document
++  reapplying them"* (tests + this guide). Patch 8 below is queued on top of `77725f2a`.
+ - Diff: `git show ce8fcf20` / `git diff 82a92a92..ce8fcf20 --stat`
+ - Config side (separate, not in git): `vigolium-tuning.sh` in the scan working
+   directory applies `agent.olium.*` settings via `vigolium config set`. If a
+@@ -18,13 +18,50 @@ made one redundant.
+ Everything below is written in terms of **symbols and strings**, not line
+ numbers, because line numbers do not survive a rebase.
+ 
++## Config side (not in git)
++
++The code patches change behaviour; these settings are what the runs actually need.
++On a fresh instance they are `vigolium config set <key> <value>` (the same values
++the `vigolium-tuning.sh` script in the scan working directory applies, plus the
++keys patch 6 added):
++
++```bash
++# engine budgets (the last three are only settable because of patch 6)
++vigolium config set agent.olium.max_turns 400
++vigolium config set agent.olium.call_timeout_sec 3600
++vigolium config set agent.olium.section_max_turns 40
++vigolium config set agent.olium.stall_turns 20
++vigolium config set agent.olium.stall_rotations 5
++# operator mode: shadow lands findings directly, so a stall-stop is not fatal
++vigolium config set agent.olium.autopilot_mode shadow
++# DB context injected into every prompt (defaults are 50/100/20/50)
++vigolium config set agent.context_limits.max_findings 200
++vigolium config set agent.context_limits.max_endpoints 400
++vigolium config set agent.context_limits.max_high_risk 60
++vigolium config set agent.context_limits.min_risk_score 30
++# keep 4xx bookkeeping records; keep the jstangle admission ceiling valid
++vigolium config set discovery.jstangle.persist_not_found_emit_statuses 400,405,415,422
++vigolium config set discovery.jstangle.hard_input_mb 16
++# template coverage in every profile (source-based runs skip the pre-scan, and the
++# agent only reaches the template phase if it asks for it)
++vigolium config set scanning_strategy.lite.known_issue_scan true
++vigolium config set scanning_strategy.balanced.known_issue_scan true
++vigolium config set scanning_strategy.deep.known_issue_scan true
++```
++
++Two notes from this instance: `agent.olium.max_concurrent` is 4 here (the tuning
++script suggests 7 — raise it only if the endpoint tolerates the extra in-flight
++calls), and `scanning_pace.max_duration: 1h` bounds native phases, with the
++known-issue phase taking half of it (`duration_factor=0.5` → 30m).
++
+ ## What the patches encode (preserve these invariants when rebasing)
+ 
+ 1. **Progress is target-facing.** The stall detector counts only tools that
+-   touch the target or record a result (`productiveTools`). Reading source,
+-   querying a database through `bash`, or replaying a request by hand is real
+-   work but counts as *zero* progress — so a policy that stops a run on
+-   "no progress" must not also throw the run's evidence away.
++   touch the target or record a result (`productiveTools`), plus a `bash` turn
++   that speaks HTTP to an in-scope host (patch 9). Reading source, grepping for a
++   URL, or querying a database through `bash` is real work but counts as *zero*
++   progress — so a policy that stops a run on "no progress" must not also throw
++   the run's evidence away.
+ 2. **The triage's read scope must equal its write scope.** It reads findings
+    project-wide; therefore its verdicts must be able to land on any row it
+    judged — a run's own findings, its child runs' findings, and rows with no run
+@@ -54,6 +91,10 @@ check "5 artifact synthesis"               "synthesizeAutopilotFindingArtifacts"
+ check "5 whitebox evidence heuristic"      "source_file"                           pkg/agent/autopilot_context.go
+ check "6 section budgets (config)"         "section_max_turns"                     internal/config
+ check "7 project-name error propagated"    "cannot scope this run to a project"    pkg/cli
++check "8 artifact shapes accepted"         "Accept both documented shapes"         pkg/agent/autopilot_context.go
++check "9 target-facing bash counts"        "productiveCall"                       pkg/olium/autopilot
++check "10 warning vs error label"          "runMessageLabel"                      pkg/cli
++check "10 linked-record evidence"          "http_record_uuids"                    pkg/agent/autopilot_context.go
+ ```
+ 
+ ## Regression suite
+@@ -61,7 +102,7 @@ check "7 project-name error propagated"    "cannot scope this run to a project"
+ ```bash
+ # The whole patch stack's tests, one command:
+ go test ./pkg/olium/autopilot/ ./pkg/agent/ ./pkg/database/ ./internal/config/ ./pkg/cli/ \
+-  -run 'TestRunGrantsReportOnlyTurn|TestRunNoFinalReportTurnOptOut|TestBuildFinalReportPromptModeAware|TestRunHonoursConfiguredStallLimits|TestWriteBackTriageVerdicts|TestUpdateFindingStatusByHashForRuns|TestHasEvidenceRecognisesWhiteboxProvenance|TestDefaultAgentConfig_Olium|TestAutopilotUnknownProjectNameFailsFast' \
++  -run 'TestRunGrantsReportOnlyTurn|TestRunNoFinalReportTurnOptOut|TestBuildFinalReportPromptModeAware|TestRunHonoursConfiguredStallLimits|TestWriteBackTriageVerdicts|TestUpdateFindingStatusByHashForRuns|TestHasEvidenceRecognisesWhiteboxProvenance|TestDefaultAgentConfig_Olium|TestAutopilotUnknownProjectNameFailsFast|TestCountEvidenceBackedFindingsAcceptsPlainStringEntries|TestProductiveCall|TestRunCountsTargetFacingBashAsProgress|TestRunStillStallsOnNonTargetBash|TestRunMessageLabel' \
+   -count=1
+ ```
+ 
+@@ -217,11 +258,86 @@ cover knobs that did not exist before the patch.
+ - **Test.** `TestAutopilotUnknownProjectNameFailsFast` (`pkg/cli`), which runs the
+   real CLI through the package's child-process harness.
+ 
++## 8. The artifact check accepts the operator's shapes
++
++- **Symptom.** A run that produced both artifacts still ends degraded with
++  `failed to parse dismissed.json as findings artifact`.
++- **Root cause.** `countEvidenceBackedFindings` accepted only an array of
++  *objects* or `{"findings": […]}`. The operator writes `dismissed.json` as a
++  flat array of ruled-out reasons — plain strings — so a complete artifact was
++  rejected outright (observed live: 9 dismissals reported as a parse failure).
++- **Fix.** Parse into `[]any` (flat array or `findings` wrapper) and treat
++  non-object entries as notes: they count where no evidence check applies (the
++  dismissed artifact) and stay flagged as evidence-free in `findings.json`.
++- **Tests.** `TestCountEvidenceBackedFindingsAcceptsPlainStringEntries`
++  (`pkg/agent/autopilot_evidence_test.go`), written from the live failure
++  (`count = 0`, warning `failed to parse dismissed.json …`).
++
++## 9. Target-facing `bash` counts as progress
++
++- **Symptom.** An operator verifies through the shell — `curl` with a harvested
++  session cookie, replaying a captured request, probing a route by hand — and is
++  stall-halted anyway ("no productive tool call across 3 consecutive sections"),
++  losing the findings it was about to record. Observed live: two rotations at 12
++  turns each, ~75 `bash` calls of which many were `curl` against the target, halt
++  after ~36 turns.
++- **Root cause.** `productiveTools` is a static tool-name set, and `bash` is in
++  it only when the *command* is target-facing — information the set cannot see.
++- **Fix.**
++  - `pkg/olium/autopilot/rotation.go`: `productiveCall(name, args, hosts)`
++    extends the set with a `bash` call whose command names both an HTTP client
++    (`httpBashClients`) and an in-scope host; `bashTargetsHost`,
++    `containsWord` (so `curl` matches `curl -s` but not `curl_to_json.py`),
++    `progressTargetHosts` + `normalizeHostString` (target + `--scope`, loopback
++    aliases included, ports/paths/userinfo/wildcards stripped).
++  - `pkg/olium/autopilot/autopilot.go`: the loop stashes `ToolArgs` at
++    `engine.EventToolExecStart` and decides with `productiveCall` at
++    `EventToolExecEnd` — **`EventToolExecEnd` carries no args**, which is the
++    detail that makes this patch more than a one-liner.
++- **Deliberately still unproductive:** source reads, `grep` for a target URL,
++  `docker exec … mysql` against the target's database, clients named only inside
++  filenames. Widen `agent.olium.stall_turns` / `stall_rotations` for those.
++- **Tests.** `TestProductiveCall`, `TestProgressTargetHosts`,
++  `TestRunCountsTargetFacingBashAsProgress` (hermetic: a provider that only
++  shells out to `curl --version`/a refused loopback port) and its negative twin
++  `TestRunStillStallsOnNonTargetBash` (`pkg/olium/autopilot/progress_test.go`).
++
++## 10. A finished run does not read as broken
++
++- **Symptom.** `vigolium agent session <uuid>` prints `✖ Error` for a run whose
++  status is `completed_with_warnings`, so a successful run (7h45m, 13 findings)
++  looks failed. Two separate causes produced this impression.
++- **Root cause / fix A — the heading.** A warned run keeps its warning list in
++  the same field a failed run keeps its error (`agentic_scans.error_message`), and
++  the detail view hard-coded the `Error` heading. `runMessageLabel` in
++  `pkg/cli/agent_session.go` now picks `Warnings` (orange, `WarningSymbol`) for
++  `completed_with_warnings` and `Error` otherwise — for the parent run and for
++  child runs in the same view.
++- **Root cause / fix B — the evidence heuristic.** `countEvidenceBackedFindings`
++  only accepted an inlined `request`/`response`/`evidence`/`source_file`, so a
++  finding that cites linked HTTP records (`http_record_uuids`) counted as
++  evidence-free: the run reported "findings.json contains 19 entries without
++  evidence references" when 7 of those 19 had linked records. `hasEvidence` now
++  also accepts non-empty `http_record_uuids` / `evidence_record_uuids`
++  (`pkg/agent/autopilot_context.go`), including `[]string`, and still rejects an
++  empty list.
++- **Tests.** `TestRunMessageLabel` (`pkg/cli/agent_session_label_test.go`) and the
++  reference-list cases in `TestHasEvidenceRecognisesWhiteboxProvenance`
++  (`pkg/agent/autopilot_evidence_test.go`). Against the real artifact of the run
++  that surfaced this, the same counter went from `count=6 / 19 unsupported` to
++  `count=13 / 12 unsupported`, and the surviving warning is the accurate one.
++- **Prompt side (not code).** Only 1 of that run's 13 operator findings stored a
++  request/response body and 6 cite a source file, so the report has 12 findings
++  with no reference at all: `report_finding` should carry the request/response the
++  operator observed, or the record it replayed (see the operator brief's
++  Deliverable section).
++
+ ## Reapplying on a new release
+ 
+ ```bash
+ cd ~/Projects/vigolium-vX.Y.Z
+-git cherry-pick ce8fcf20            # or: git rebase --onto vX.Y.Z 82a92a92 <branch>
++git cherry-pick ce8fcf20 77725f2a   # plus any later patch commit; or:
++                                    # git rebase --onto vX.Y.Z 82a92a92 <branch>
+ ```
+ 
+ Conflict hotspots (rebasing: expect these, they are the ones that touch hot code):
+diff --git a/pkg/agent/autopilot_context.go b/pkg/agent/autopilot_context.go
+index f334273b..35cf596f 100644
+--- a/pkg/agent/autopilot_context.go
++++ b/pkg/agent/autopilot_context.go
+@@ -671,29 +671,40 @@ func countEvidenceBackedFindings(path string, evidenceDir string) (int, string)
+ 		return 0, fmt.Sprintf("failed to read %s: %v", filepath.Base(path), err)
+ 	}
+ 
+-	var arr []map[string]any
+-	if err := json.Unmarshal(data, &arr); err != nil {
++	// Accept both documented shapes — a flat array, or an object wrapping a
++	// "findings" array — and let entries be any JSON value, because the
++	// operator's dismissed.json is a flat list of ruled-out reasons as plain
++	// strings. Rejecting that shape turned a complete run into
++	// "failed to parse dismissed.json as findings artifact" even though every
++	// dismissal was present.
++	var items []any
++	if err := json.Unmarshal(data, &items); err != nil {
+ 		var wrapper struct {
+-			Findings []map[string]any `json:"findings"`
++			Findings []any `json:"findings"`
+ 		}
+ 		if err2 := json.Unmarshal(data, &wrapper); err2 != nil {
+ 			return 0, fmt.Sprintf("failed to parse %s as findings artifact", filepath.Base(path))
+ 		}
+-		arr = wrapper.Findings
++		items = wrapper.Findings
+ 	}
+ 
+ 	count := 0
+-	for _, item := range arr {
+-		if evidenceDir == "" {
+-			count++
++	for _, raw := range items {
++		item, isObject := raw.(map[string]any)
++		if !isObject {
++			// No evidence fields to inspect on a plain string, so it counts
++			// only where no evidence check applies (the dismissed artifact).
++			if evidenceDir == "" {
++				count++
++			}
+ 			continue
+ 		}
+-		if hasEvidence(item, evidenceDir) {
++		if evidenceDir == "" || hasEvidence(item, evidenceDir) {
+ 			count++
+ 		}
+ 	}
+-	if len(arr) > count {
+-		return count, fmt.Sprintf("%s contains %d entries without evidence references", filepath.Base(path), len(arr)-count)
++	if len(items) > count {
++		return count, fmt.Sprintf("%s contains %d entries without evidence references", filepath.Base(path), len(items)-count)
+ 	}
+ 	return count, ""
+ }
+@@ -708,11 +719,20 @@ func hasEvidence(item map[string]any, evidenceDir string) bool {
+ 			return true
+ 		}
+ 	}
+-	if raw, ok := item["evidence_files"]; ok {
+-		switch files := raw.(type) {
++	// Reference lists: a linked record is the evidence for a finding that cites
++	// one, even when the body itself was not inlined (the operator reports a
++	// finding with `http_record_uuids` far more often than with whole bodies).
++	for _, key := range []string{"evidence_files", "http_record_uuids", "evidence_record_uuids"} {
++		switch refs := item[key].(type) {
+ 		case []any:
+-			for _, f := range files {
+-				if strings.TrimSpace(fmt.Sprint(f)) != "" {
++			for _, r := range refs {
++				if strings.TrimSpace(fmt.Sprint(r)) != "" {
++					return true
++				}
++			}
++		case []string:
++			for _, r := range refs {
++				if strings.TrimSpace(r) != "" {
+ 					return true
+ 				}
+ 			}
+diff --git a/pkg/agent/autopilot_evidence_test.go b/pkg/agent/autopilot_evidence_test.go
+index cdb37f75..b8877b44 100644
+--- a/pkg/agent/autopilot_evidence_test.go
++++ b/pkg/agent/autopilot_evidence_test.go
+@@ -3,6 +3,7 @@ package agent
+ import (
+ 	"os"
+ 	"path/filepath"
++	"strings"
+ 	"testing"
+ )
+ 
+@@ -28,6 +29,9 @@ func TestHasEvidenceRecognisesWhiteboxProvenance(t *testing.T) {
+ 		{"http body", map[string]any{"request": "GET / HTTP/1.1"}, emptyDir, true},
+ 		{"evidence path", map[string]any{"evidence_path": "poc.md"}, emptyDir, true},
+ 		{"evidence files", map[string]any{"evidence_files": []any{"poc.md"}}, emptyDir, true},
++		{"linked record reference", map[string]any{"http_record_uuids": []any{"0f1e2d3c-4b5a"}}, emptyDir, true},
++		{"linked record reference (string slice)", map[string]any{"evidence_record_uuids": []string{"0f1e2d3c"}}, emptyDir, true},
++		{"empty reference list", map[string]any{"http_record_uuids": []any{}}, emptyDir, false},
+ 		{"source location (whitebox)", map[string]any{"source_file": "lib/auth.php:3"}, emptyDir, true},
+ 		{"no evidence at all", map[string]any{"title": "x", "severity": "high"}, emptyDir, false},
+ 		{"evidence dir holds files", map[string]any{"title": "x"}, populatedDir, true},
+@@ -41,3 +45,47 @@ func TestHasEvidenceRecognisesWhiteboxProvenance(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// TestCountEvidenceBackedFindingsAcceptsPlainStringEntries pins the shape the
++// operator actually writes for dismissed.json: a flat array of ruled-out
++// reasons as plain strings. The counter only understood an array of objects or
++// a {"findings": [...]} wrapper, so a run that produced its findings and its
++// dismissals was reported degraded with "failed to parse dismissed.json as
++// findings artifact" — the entries were there, just not in the expected shape.
++// String entries carry no evidence fields, so they count only where no evidence
++// is required (the dismissed artifact).
++func TestCountEvidenceBackedFindingsAcceptsPlainStringEntries(t *testing.T) {
++	dir := t.TempDir()
++	// Shape (and style of entry) taken from a real run's autopilot/dismissed.json.
++	body := `[
++  "M1 dot-notation live PoC not reproduced dynamically: GET /backend/UserManager/getUsers and GET /backend/user.manager/getUsers both returned HTTP 400 (identical to baseline), not the expected 401-vs-200 differential.",
++  "M1 exploitability blocked by data state: the demo DB has only one backend user with full access — no restricted role existed to exercise the fail-open path.",
++  "GET /backend/ returned 302 to the login form as expected."
++]`
++
++	dismissed := filepath.Join(dir, "dismissed.json")
++	if err := os.WriteFile(dismissed, []byte(body), 0o600); err != nil {
++		t.Fatalf("write dismissed artifact: %v", err)
++	}
++	count, warn := countEvidenceBackedFindings(dismissed, "")
++	if count != 3 {
++		t.Errorf("dismissed count = %d, want 3 (every entry counts where no evidence is required)", count)
++	}
++	if warn != "" {
++		t.Errorf("dismissed warning = %q, want none", warn)
++	}
++
++	// The same shape in the findings artifact must still flag the entries that
++	// carry no evidence reference.
++	findings := filepath.Join(dir, "findings.json")
++	if err := os.WriteFile(findings, []byte(body), 0o600); err != nil {
++		t.Fatalf("write findings artifact: %v", err)
++	}
++	count, warn = countEvidenceBackedFindings(findings, filepath.Join(dir, "evidence"))
++	if count != 0 {
++		t.Errorf("findings count = %d, want 0: string entries carry no evidence", count)
++	}
++	if !strings.Contains(warn, "without evidence references") {
++		t.Errorf("findings warning = %q, want an evidence-reference warning", warn)
++	}
++}
+diff --git a/pkg/cli/agent_session.go b/pkg/cli/agent_session.go
+index 5ec5ccc9..2c478276 100644
+--- a/pkg/cli/agent_session.go
++++ b/pkg/cli/agent_session.go
+@@ -184,6 +184,17 @@ func runAgentSession(cmd *cobra.Command, args []string) error {
+ 	return nil
+ }
+ 
++// runMessageLabel names the heading for a run's stored message and reports
++// whether it is a warning list rather than an error. A run that finished with
++// warnings stores them in the same field a failed run stores its error, so the
++// heading has to follow the status — otherwise a successful run reads as broken.
++func runMessageLabel(status string) (label string, isWarning bool) {
++	if status == "completed_with_warnings" {
++		return "Warnings", true
++	}
++	return "Error", false
++}
++
+ func showAgentSessionDetail(cmd *cobra.Command, ctx context.Context, repo *database.Repository, uuid string) error {
+ 	run, err := repo.GetAgenticScan(ctx, uuid)
+ 	if err != nil {
+@@ -361,9 +372,16 @@ func showAgentSessionDetail(cmd *cobra.Command, ctx context.Context, repo *datab
+ 		}
+ 	}
+ 
+-	// Error message
++	// Error / warnings. A run that finished with warnings keeps them in the same
++	// field a failed run keeps its error, so the heading follows the status: a
++	// completed run whose warning list is rendered as "Error" reads as broken.
+ 	if run.ErrorMessage != "" {
+-		fmt.Fprintf(os.Stderr, "\n  %s %s\n", terminal.Red(terminal.SymbolError), terminal.BoldRed("Error"))
++		label, isWarning := runMessageLabel(run.Status)
++		if isWarning {
++			fmt.Fprintf(os.Stderr, "\n  %s %s\n", terminal.Orange(terminal.WarningSymbol()), terminal.BoldOrange(label))
++		} else {
++			fmt.Fprintf(os.Stderr, "\n  %s %s\n", terminal.Red(terminal.SymbolError), terminal.BoldRed(label))
++		}
+ 		fmt.Fprintf(os.Stderr, "    %s\n", run.ErrorMessage)
+ 	}
+ 
+@@ -467,7 +485,12 @@ func printChildRunDetail(child *database.AgenticScan, tailLines int) {
+ 
+ 	// Error
+ 	if child.ErrorMessage != "" {
+-		fmt.Fprintf(os.Stderr, "    %-17s %s\n", terminal.Gray("Error:"), terminal.Red(child.ErrorMessage))
++		label, isWarning := runMessageLabel(child.Status)
++		if isWarning {
++			fmt.Fprintf(os.Stderr, "    %-17s %s\n", terminal.Gray(label+":"), terminal.Orange(child.ErrorMessage))
++		} else {
++			fmt.Fprintf(os.Stderr, "    %-17s %s\n", terminal.Gray(label+":"), terminal.Red(child.ErrorMessage))
++		}
+ 	}
+ 
+ 	// Session directory listing
+diff --git a/pkg/cli/agent_session_label_test.go b/pkg/cli/agent_session_label_test.go
+new file mode 100644
+index 00000000..627ed8fb
+--- /dev/null
++++ b/pkg/cli/agent_session_label_test.go
+@@ -0,0 +1,24 @@
++package cli
++
++import "testing"
++
++// TestRunMessageLabel: a run's warning list and its error share one field, so the
++// heading has to follow the status. Rendering a completed run's warnings as
++// "Error" made a 7h45m run with 13 findings read as broken.
++func TestRunMessageLabel(t *testing.T) {
++	for _, tc := range []struct {
++		status string
++		label  string
++		warn   bool
++	}{
++		{"completed_with_warnings", "Warnings", true},
++		{"failed", "Error", false},
++		{"cancelled", "Error", false},
++		{"completed", "Error", false},
++	} {
++		label, warn := runMessageLabel(tc.status)
++		if label != tc.label || warn != tc.warn {
++			t.Errorf("runMessageLabel(%q) = (%q, %v), want (%q, %v)", tc.status, label, warn, tc.label, tc.warn)
++		}
++	}
++}
+diff --git a/pkg/olium/autopilot/autopilot.go b/pkg/olium/autopilot/autopilot.go
+index 24143aa4..8b871f35 100644
+--- a/pkg/olium/autopilot/autopilot.go
++++ b/pkg/olium/autopilot/autopilot.go
+@@ -1048,6 +1048,12 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
+ 		var runLoopErr error
+ 		var fatalResult *Result
+ 
++		// EventToolExecEnd carries no args, so the bash command that decides
++		// progress is stashed when its call starts. Per-iteration on purpose: a
++		// tool call cannot outlive the iteration that dispatched it.
++		pendingToolArgs := map[string]map[string]any{}
++		targetHosts := progressTargetHosts(opts.Target, opts.Scope)
++
+ 		for ev := range events {
+ 			// Tool exec lifecycle is always echoed on the tool log; the
+ 			// per-turn usage line is gated on hadTextThisTurn below so we
+@@ -1066,8 +1072,18 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
+ 			// creates surface / mutates durable state / records a result counts
+ 			// as progress (resets the stall counter); every tool result feeds
+ 			// the recent-actions ring carried into the next section's brief.
++			//
++			// The decision needs the call's arguments, which only the start
++			// event carries — a bash turn that curls an in-scope host counts as
++			// progress (see productiveCall), and its command is only visible
++			// there.
++			if rotationEnabled && ev.Type == engine.EventToolExecStart && ev.ToolCallID != "" {
++				pendingToolArgs[ev.ToolCallID] = ev.ToolArgs
++			}
+ 			if rotationEnabled && ev.Type == engine.EventToolExecEnd {
+-				if !ev.ToolIsErr && productiveTools[ev.ToolName] {
++				args := pendingToolArgs[ev.ToolCallID]
++				delete(pendingToolArgs, ev.ToolCallID)
++				if !ev.ToolIsErr && productiveCall(ev.ToolName, args, targetHosts) {
+ 					progressedThisWindow = true
+ 				}
+ 				recentActions = appendRecentAction(recentActions, ev.ToolName, ev.ToolResult)
+diff --git a/pkg/olium/autopilot/progress_test.go b/pkg/olium/autopilot/progress_test.go
+new file mode 100644
+index 00000000..1bbb40c2
+--- /dev/null
++++ b/pkg/olium/autopilot/progress_test.go
+@@ -0,0 +1,153 @@
++package autopilot
++
++import (
++	"bytes"
++	"context"
++	"io"
++	"os/exec"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/vigolium/vigolium/pkg/olium/provider"
++	"github.com/vigolium/vigolium/pkg/olium/stream"
++)
++
++// TestProductiveCall pins the progress rule's boundary: the static tool set plus
++// a bash turn that speaks HTTP to an in-scope host. Everything else — reading
++// source, grepping for a URL, querying the target's database through docker —
++// stays unproductive, which is what keeps the stall detector meaningful.
++func TestProductiveCall(t *testing.T) {
++	hosts := progressTargetHosts("http://localhost:8080/shop", []string{"*.example.com", "https://api.internal:8443"})
++
++	cases := []struct {
++		name string
++		tool string
++		args map[string]any
++		want bool
++	}{
++		{"static productive tool", "report_finding", nil, true},
++		{"static productive tool keeps its slot", "run_native_scan", nil, true},
++		{"read-only tool", "read_file", map[string]any{"path": "x"}, false},
++		{"bash curls the target", "bash", map[string]any{"command": `curl -s -H 'Cookie: x' http://localhost/api/orders`}, true},
++		{"bash curls the loopback alias of localhost", "bash", map[string]any{"command": "curl -s http://127.0.0.1:8080/"}, true},
++		{"bash curls a scoped wildcard host", "bash", map[string]any{"command": "curl -sk https://shop.example.com/"}, true},
++		{"bash curls a scoped host with a path", "bash", map[string]any{"command": "curl -s https://api.internal:8443/v1/status"}, true},
++		{"bash wgets the target", "bash", map[string]any{"command": "wget -qO- http://localhost/"}, true},
++		{"bash curls an unrelated host", "bash", map[string]any{"command": "curl -s https://pypi.org/simple/"}, false},
++		{"bash greps for the target URL", "bash", map[string]any{"command": `grep -rn "http://localhost/api" engine/`}, false},
++		{"bash reads source", "bash", map[string]any{"command": "sed -n '1,200p' engine/Shopware/Bootstrap.php"}, false},
++		{"bash queries the target's database", "bash", map[string]any{"command": `docker exec -i shopware-mysql-1 mysql -uapp -papp shopware -e "select 1"`}, false},
++		{"client name inside a filename", "bash", map[string]any{"command": "python3 curl_to_json.py http://localhost/"}, false},
++		{"client with no host", "bash", map[string]any{"command": "curl file:///etc/passwd"}, false},
++		{"bash without a command", "bash", map[string]any{"path": "engine/"}, false},
++		{"nil args", "bash", nil, false},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			if got := productiveCall(tc.tool, tc.args, hosts); got != tc.want {
++				t.Errorf("productiveCall(%q, %v) = %v, want %v", tc.tool, tc.args, got, tc.want)
++			}
++		})
++	}
++}
++
++// TestProgressTargetHosts: the target and scope reduce to the lowercase host
++// strings a shell command would carry, with loopback aliases included.
++func TestProgressTargetHosts(t *testing.T) {
++	hosts := strings.Join(progressTargetHosts("http://localhost:8080/shop", []string{"*.example.com", "https://api.internal:8443", "user:pw@other.example.net"}), ",")
++	for _, want := range []string{"localhost", "127.0.0.1", "example.com", "api.internal", "other.example.net"} {
++		if !strings.Contains(hosts, want) {
++			t.Errorf("hosts %q missing %q", hosts, want)
++		}
++	}
++	for _, unwanted := range []string{"8080", "/shop", "8443", "user:pw"} {
++		if strings.Contains(hosts, unwanted) {
++			t.Errorf("hosts %q should not carry %q", hosts, unwanted)
++		}
++	}
++	if got := progressTargetHosts("", nil); len(got) != 0 {
++		t.Errorf("empty target/scope = %v, want none", got)
++	}
++}
++
++// bashProvider answers every turn with one bash call carrying command, so the
++// loop's progress accounting can be driven without a model.
++type bashProvider struct {
++	promptRecorder
++	command string
++}
++
++func (*bashProvider) Name() string { return "bash-loop" }
++
++func (p *bashProvider) Stream(ctx context.Context, req provider.Request) (<-chan stream.Event, error) {
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
++	p.record(req)
++	ch := make(chan stream.Event, 4)
++	go func() {
++		defer close(ch)
++		ch <- stream.Event{Type: stream.EventToolCallStart, ToolCall: &stream.ToolCall{ID: "b1", Name: "bash"}}
++		ch <- stream.Event{Type: stream.EventToolCallEnd, ToolCall: &stream.ToolCall{ID: "b1", Name: "bash", Arguments: map[string]any{"command": p.command}}}
++		ch <- stream.Event{Type: stream.EventDone, StopReason: stream.StopReasonToolUse}
++	}()
++	return ch, nil
++}
++
++// runBashLoop drives a shadow-mode run whose operator only ever calls bash with
++// command, in a tiny loop bounded by the turn budget.
++func runBashLoop(t *testing.T, command string) string {
++	t.Helper()
++	if _, err := exec.LookPath("curl"); err != nil {
++		t.Skip("curl is not on PATH: the bash call would fail, and a failed call never counts as progress")
++	}
++	t.Setenv("HOME", t.TempDir())
++	var toolLog bytes.Buffer
++	opts := Options{
++		Provider:      &bashProvider{command: command},
++		Model:         "claude-sonnet-4",
++		Out:           io.Discard,
++		ToolLog:       &toolLog,
++		NoSkillFilter: true,
++		SourcePath:    t.TempDir(),
++		SessionDir:    t.TempDir(),
++		Mode:          "shadow",
++		Target:        "http://127.0.0.1:8080",
++		MaxTurns:      12,
++		// A productive loop has nothing to trip it: sections rotate and each
++		// gets a fresh turn budget, so the run is bounded here by the tool-call
++		// budget, which survives rotation by design.
++		MaxToolCalls:       12,
++		MaxTurnsPerSection: 4,
++		StallTurns:         2,
++		MaxStallRotations:  1,
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
++	defer cancel()
++	if _, err := Run(ctx, opts); err != nil {
++		t.Fatalf("Run: %v", err)
++	}
++	return toolLog.String()
++}
++
++// TestRunCountsTargetFacingBashAsProgress: a shell turn that puts a request on
++// the wire keeps the session alive. Before the rule existed this run was
++// stall-halted after two turns even though every turn probed the target — the
++// exact shape that cost a real 2.5h run its findings.
++func TestRunCountsTargetFacingBashAsProgress(t *testing.T) {
++	log := runBashLoop(t, "curl -s -o /dev/null --max-time 1 http://127.0.0.1:9/ || true")
++	if strings.Contains(log, "no productive tool call") {
++		t.Errorf("a bash turn curling an in-scope host was treated as a stall:\n%s", log)
++	}
++}
++
++// TestRunStillStallsOnNonTargetBash: the rule is not an escape hatch — the same
++// loop with a command that never addresses the target still trips the guard.
++func TestRunStillStallsOnNonTargetBash(t *testing.T) {
++	log := runBashLoop(t, "curl --version >/dev/null 2>&1; echo nothing-to-see-here")
++	if !strings.Contains(log, "no productive tool call") {
++		t.Errorf("bash that never addresses the target must still trip the stall guard:\n%s", log)
++	}
++}
+diff --git a/pkg/olium/autopilot/rotation.go b/pkg/olium/autopilot/rotation.go
+index be6224f4..3ede7d16 100644
+--- a/pkg/olium/autopilot/rotation.go
++++ b/pkg/olium/autopilot/rotation.go
+@@ -41,6 +41,157 @@ var productiveTools = map[string]bool{
+ 	"propose_candidate": true,
+ }
+ 
++// httpBashClients are the command names that, run through bash, put requests on
++// the wire. Their presence is what separates a target-facing shell turn from
++// bookkeeping.
++//
++// Deliberately narrow: bare `http`, `nc` and `python` occur in prose, URLs and
++// filenames often enough that a substring match on them means nothing.
++var httpBashClients = []string{"curl", "wget", "httpie", "httpx", "hurl", "ncat", "netcat"}
++
++// productiveCall reports whether a finished tool call counts as progress for the
++// stall detector. It extends productiveTools with the one case the static map
++// cannot express: a bash turn that speaks HTTP to an in-scope host.
++//
++// Without it an operator that verifies through the shell — `curl` with a
++// harvested session cookie, say — reads as stalled even though it is probing the
++// target, which is exactly the work the detector exists to encourage. The
++// command has to name both an HTTP client and one of the run's hosts, so reading
++// source, grepping for a URL, or querying the target's database through
++// `docker exec` still counts as no progress.
++func productiveCall(name string, args map[string]any, hosts []string) bool {
++	if productiveTools[name] {
++		return true
++	}
++	if name != "bash" {
++		return false
++	}
++	command, _ := args["command"].(string)
++	return bashTargetsHost(command, hosts)
++}
++
++// bashTargetsHost reports whether command speaks HTTP to one of hosts. Matching
++// is textual on purpose — the command is a shell string, not an argv — so a
++// command that only quotes a target URL in a search pattern is filtered out by
++// the client-name requirement rather than by parsing.
++func bashTargetsHost(command string, hosts []string) bool {
++	if command == "" || len(hosts) == 0 {
++		return false
++	}
++	if !containsWord(command, httpBashClients...) {
++		return false
++	}
++	lower := strings.ToLower(command)
++	for _, h := range hosts {
++		if h != "" && strings.Contains(lower, h) {
++			return true
++		}
++	}
++	return false
++}
++
++// containsWord reports whether s contains any of words as a whole word, so
++// "curl" matches `curl -s` but not `curl_to_json.py`.
++func containsWord(s string, words ...string) bool {
++	lower := strings.ToLower(s)
++	for _, w := range words {
++		for idx := 0; idx < len(lower); {
++			i := strings.Index(lower[idx:], w)
++			if i < 0 {
++				break
++			}
++			start := idx + i
++			end := start + len(w)
++			if !isWordByte(lower, start-1) && !isWordByte(lower, end) {
++				return true
++			}
++			idx = end
++		}
++	}
++	return false
++}
++
++// isWordByte reports whether s[i] is a character that would make a match part of
++// a longer word (`_`, `-`, letters, digits).
++func isWordByte(s string, i int) bool {
++	if i < 0 || i >= len(s) {
++		return false
++	}
++	c := s[i]
++	return c == '_' || c == '-' || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
++}
++
++// progressTargetHosts turns the run's target and scope into the lowercase host
++// strings a bash command must name to count as target-facing progress. Loopback
++// aliases are included because an operator told `http://localhost` may write
++// 127.0.0.1 (or [::1]) in the shell.
++func progressTargetHosts(target string, scope []string) []string {
++	seen := map[string]bool{}
++	var hosts []string
++	addHost := func(raw string) {
++		primary := normalizeHostString(raw)
++		if primary == "" {
++			return
++		}
++		aliases := []string{primary}
++		switch primary {
++		case "localhost":
++			aliases = append(aliases, "127.0.0.1", "[::1]")
++		case "127.0.0.1":
++			aliases = append(aliases, "localhost", "[::1]")
++		}
++		for _, a := range aliases {
++			if !seen[a] {
++				seen[a] = true
++				hosts = append(hosts, a)
++			}
++		}
++	}
++	addHost(target)
++	for _, s := range scope {
++		addHost(s)
++	}
++	return hosts
++}
++
++// normalizeHostString reduces a target URL or scope pattern to the substring a
++// shell command would carry: no scheme, no userinfo, no port, no path, no
++// wildcard prefix.
++func normalizeHostString(raw string) string {
++	s := strings.ToLower(strings.TrimSpace(raw))
++	if s == "" {
++		return ""
++	}
++	if i := strings.Index(s, "://"); i >= 0 {
++		s = s[i+3:]
++	}
++	if i := strings.IndexAny(s, "/?#"); i >= 0 {
++		s = s[:i]
++	}
++	if i := strings.LastIndex(s, "@"); i >= 0 {
++		s = s[i+1:]
++	}
++	if i := strings.LastIndex(s, ":"); i > 0 && allDigits(s[i+1:]) {
++		s = s[:i]
++	}
++	s = strings.TrimPrefix(s, "*.")
++	s = strings.TrimPrefix(s, ".")
++	return strings.TrimSuffix(s, ".")
++}
++
++// allDigits reports whether s is a non-empty run of ASCII digits (a port).
++func allDigits(s string) bool {
++	if s == "" {
++		return false
++	}
++	for i := range len(s) {
++		if s[i] < '0' || s[i] > '9' {
++			return false
++		}
++	}
++	return true
++}
++
+ // buildRotationMission assembles the compact mission line reused at the top of
+ // every reconstructed brief. The heavy detail (plan, notes, stop criteria)
+ // lives in the durable scratchpad, so this stays short — the whole point of
+-- 
+2.56.0
+

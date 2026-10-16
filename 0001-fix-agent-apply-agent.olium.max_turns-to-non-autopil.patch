@@ -1,0 +1,166 @@
+From 82a92a929086e7be8eba65de35f8e97bf7c4a1d4 Mon Sep 17 00:00:00 2001
+From: Wolfram Huesken <woh@m18.io>
+Date: Tue, 13 Oct 2026 15:55:28 +0200
+Subject: [PATCH 1/5] fix(agent): apply agent.olium.max_turns to non-autopilot
+ engine runs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+buildOliumEngineWithSpec built the olium engine with MaxTurns from the
+per-call SessionSpec only, and every shared-engine caller — triage
+(RunTriageLoop), swarm phases, source analysis, query — passes no per-call
+cap. spec.MaxTurns was therefore always 0 and oengine.New fell back to its
+hardcoded 32, so agent.olium.max_turns was parsed, defaulted and documented
+but read by nothing: an operator raising it to 128 still got 32 turns.
+
+A 25-finding autopilot triage batch needs far more than 32 turns (it
+re-verifies source, stored records and live probes per finding), and the
+ceiling surfaces as a plain error where autopilot's own loop treats it as a
+budget stop — so the batch failed and took the whole triage round with it:
+
+    [triage] aborted: triage round 0 batch 1 failed:
+    agent execution failed: olium: exceeded max turns (32)
+
+Fall back to cfg.MaxTurns when SessionSpec.MaxTurns is unset. Per-call caps
+(guardrail 1, intent 30, verifier) still win, and 0 at both levels leaves the
+engine default of 32 in place. TestMaxTurnsResolution drives a real engine
+against an OpenAI-compatible httptest endpoint that always answers with a
+tool call, pinning all three levels by the ceiling that actually fires.
+---
+ pkg/agent/max_turns_test.go | 92 +++++++++++++++++++++++++++++++++++++
+ pkg/agent/olium_adapter.go  | 13 +++++-
+ 2 files changed, 104 insertions(+), 1 deletion(-)
+ create mode 100644 pkg/agent/max_turns_test.go
+
+diff --git a/pkg/agent/max_turns_test.go b/pkg/agent/max_turns_test.go
+new file mode 100644
+index 00000000..4effebf3
+--- /dev/null
++++ b/pkg/agent/max_turns_test.go
+@@ -0,0 +1,92 @@
++package agent
++
++import (
++	"context"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/vigolium/vigolium/internal/config"
++	oengine "github.com/vigolium/vigolium/pkg/olium/engine"
++)
++
++// turnCeilingSSE answers every provider call with a complete tool call, so the
++// engine keeps looping until its turn ceiling fires instead of ending the run
++// on its own. The tool name is a builtin that IncludeTools registers and that
++// fails fast on empty arguments (bash rejects an empty command without
++// spawning a shell), so each turn is dispatched and consumed promptly.
++func turnCeilingSSE(w http.ResponseWriter) {
++	w.Header().Set("Content-Type", "text/event-stream")
++	w.WriteHeader(http.StatusOK)
++	_, _ = fmt.Fprint(w, "data: "+`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_bash","type":"function","function":{"name":"bash","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`+"\n\n")
++	if f, ok := w.(http.Flusher); ok {
++		f.Flush()
++	}
++	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
++}
++
++// TestMaxTurnsResolution pins the turn ceiling an engine built from config ends
++// up with: a per-call SessionSpec.MaxTurns (guardrail 1, intent 30, verifier
++// cap) wins, otherwise agent.olium.max_turns applies, otherwise the engine's
++// own default (32) stands.
++//
++// The fallback is the point of the test: triage and the other shared-engine
++// callers pass no per-call cap, so a dropped config value silently capped them
++// at 32 turns — a 25-finding triage batch blew through it and aborted the pass.
++func TestMaxTurnsResolution(t *testing.T) {
++	cases := []struct {
++		name      string
++		cfgTurns  int
++		specTurns int
++		want      string
++	}{
++		{name: "config knob reaches the engine", cfgTurns: 7, specTurns: 0, want: "exceeded max turns (7)"},
++		{name: "per-call override wins", cfgTurns: 7, specTurns: 3, want: "exceeded max turns (3)"},
++		{name: "neither set keeps the engine default", cfgTurns: 0, specTurns: 0, want: "exceeded max turns (32)"},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++				turnCeilingSSE(w)
++			}))
++			defer srv.Close()
++
++			cfg := &config.OliumConfig{
++				Provider: "openai-compatible",
++				MaxTurns: tc.cfgTurns,
++				CustomProvider: config.CustomProviderConfig{
++					BaseURL: srv.URL + "/v1",
++					ModelID: "test-model",
++					APIKey:  "test-key",
++				},
++			}
++
++			eng, err := buildOliumEngineWithSpec(cfg, SessionSpec{IncludeTools: true, MaxTurns: tc.specTurns})
++			if err != nil {
++				t.Fatalf("build engine: %v", err)
++			}
++
++			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
++			defer cancel()
++
++			var errMsg string
++			for ev := range eng.Run(ctx, "go") {
++				if ev.Type == oengine.EventError {
++					errMsg = ev.Err
++					break
++				}
++				if ev.Type == oengine.EventRunDone {
++					break
++				}
++			}
++
++			if !strings.Contains(errMsg, tc.want) {
++				t.Fatalf("engine stopped with %q, want it to contain %q", errMsg, tc.want)
++			}
++		})
++	}
++}
+diff --git a/pkg/agent/olium_adapter.go b/pkg/agent/olium_adapter.go
+index 26fbf289..9e8391b4 100644
+--- a/pkg/agent/olium_adapter.go
++++ b/pkg/agent/olium_adapter.go
+@@ -130,11 +130,22 @@ func buildOliumEngineWithSpec(cfg *config.OliumConfig, spec SessionSpec) (*oengi
+ 		system += "\n\nApplication source code is available at: " + spec.SourcePath
+ 	}
+ 
++	// Turn ceiling for this engine: a per-call override (SessionSpec.MaxTurns —
++	// the guardrail's 1, intent's 30, the verifier's own cap) wins; otherwise
++	// fall back to agent.olium.max_turns, which is the knob operators set for
++	// exactly these non-autopilot engine uses (triage, swarm phases, source
++	// analysis, query). Until this fallback existed the config value was read
++	// by nothing and every such run silently used the engine default of 32.
++	maxTurns := spec.MaxTurns
++	if maxTurns <= 0 {
++		maxTurns = cfg.MaxTurns
++	}
++
+ 	ecfg := oengine.Config{
+ 		Provider:          prov,
+ 		Model:             model,
+ 		System:            system,
+-		MaxTurns:          spec.MaxTurns,
++		MaxTurns:          maxTurns,
+ 		EnablePromptCache: spec.EnablePromptCache,
+ 		// Skills, when set, are rendered into the system prompt as an
+ 		// <available_skills> block by engine.New. The load_skill tool that
+
+base-commit: 6bd0897010bbd75a983ec760cff29e4c366b49ef
+-- 
+2.56.0
+

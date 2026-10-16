@@ -1,0 +1,2176 @@
+From ce8fcf20af737006ab856e72ebe8227fe9ee9001 Mon Sep 17 00:00:00 2001
+From: Wolfram Huesken <woh@m18.io>
+Date: Wed, 14 Oct 2026 08:47:33 +0200
+Subject: [PATCH 2/5] Fixed some weird behaviour causing the scan to degrade
+
+---
+ CHANGELOG.md                                  |  14 ++
+ docs/agentic-scan/autopilot.md                |  60 +++++
+ internal/config/agent.go                      |  25 +++
+ internal/config/agent_test.go                 |   1 +
+ .../autopilot_artifact_synthesis_test.go      | 192 ++++++++++++++++
+ pkg/agent/autopilot_auth.go                   |  45 +++-
+ pkg/agent/autopilot_auth_warning_test.go      | 119 ++++++++++
+ pkg/agent/autopilot_context.go                | 183 ++++++++++++++-
+ pkg/agent/autopilot_pipeline.go               | 105 ++++++++-
+ pkg/agent/session_repair.go                   |  22 +-
+ pkg/agent/triage.go                           |  42 +++-
+ pkg/agent/triage_writeback_test.go            | 165 ++++++++++++++
+ pkg/cli/agent.go                              |   5 +-
+ pkg/cli/agent_autopilot.go                    |  10 +-
+ pkg/cli/agent_autopilot_olium.go              |  12 +-
+ pkg/database/findings_coverage_test.go        |  86 +++++++
+ pkg/database/repository_findings.go           |  49 ++++
+ pkg/olium/autopilot/autopilot.go              | 159 ++++++++++++-
+ pkg/olium/autopilot/final_report_test.go      | 211 ++++++++++++++++++
+ pkg/olium/autopilot/halt.go                   |  23 ++
+ pkg/olium/autopilot/section.go                |  35 ++-
+ pkg/olium/vigtool/auth_session.go             |  43 +++-
+ pkg/olium/vigtool/auth_session_test.go        |  63 ++++++
+ pkg/server/handlers_agent_autopilot.go        |   3 +
+ 24 files changed, 1635 insertions(+), 37 deletions(-)
+ create mode 100644 pkg/agent/autopilot_artifact_synthesis_test.go
+ create mode 100644 pkg/agent/autopilot_auth_warning_test.go
+ create mode 100644 pkg/agent/triage_writeback_test.go
+ create mode 100644 pkg/olium/autopilot/final_report_test.go
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 437d34bb..590a7b8d 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,20 @@
+ 
+ All notable changes to this project will be documented in this file.
+ 
++## [Unreleased]
++
++### Added
++
++- `agent.olium.section_max_turns` / `agent.olium.stall_turns` / `agent.olium.stall_rotations` tune the durable-autopilot section budgets (defaults 40 / 12 / 3) instead of pinning them to package constants.
++- Autopilot grants a *stopped* run one report-only turn. When the stall guard stops a run, or the engine gives up on its own, and nothing was reported, the loop re-enters once with a reset context, a mission that points at the run transcript and requires the finding tool for everything verified, plus the `findings.json` / `dismissed.json` artifacts. The turn is exempt from the stall guard (recovering evidence by reading looks unproductive to it) and ends the run when it reaches its section limit. Opt out with `Options.NoFinalReportTurn`.
++
++### Fixed
++
++- Autopilot triage wrote its verdicts scoped to the run's own UUID, so findings imported by a child audit run stayed `draft` — unreachable by `vigolium finding --verdict confirmed,triaged` and absent from reports. The same scope also never matched rows stored without any run UUID (pre-scan and passive findings), so their verdicts were dropped silently while the rows kept the scanner's status. The write-back now spans the run, its child runs, and unattributed rows — rows owned by a *different* run are still left alone.
++- `findings.json` / `dismissed.json` were a model obligation: when the operator did not write them the run warned "artifact missing" even though the findings were in the database. They are now synthesized from the DB once verify-before-promote and triage have finished, so the artifact reflects the run's judged findings; operator-authored files still win.
++- An invalid discovered auth session produced only "some discovered auth sessions were invalid and could not be repaired" — no names, no reasons — which sent the operator hunting for sessions that do not exist. The warning now names the dropped entries, their validation errors and the usable sessions; the repair failure is logged with its cause; and `auth_session_lookup` on an unknown name lists the configured sessions.
++- `--project-name` that names no project was silently ignored on the autopilot and agent-query paths: the run wrote its findings into the Default Project and the post-run triage failed for want of a project UUID, with nothing in the log explaining why. Resolution errors are now propagated (`cannot scope this run to a project: ...`) instead of being discarded.
++
+ ## [v0.5.3] - 2026-10-10
+ 
+ ### Added
+diff --git a/docs/agentic-scan/autopilot.md b/docs/agentic-scan/autopilot.md
+index 00c2648e..aed99d94 100644
+--- a/docs/agentic-scan/autopilot.md
++++ b/docs/agentic-scan/autopilot.md
+@@ -242,6 +242,35 @@ The autopilot exits in one of four ways:
+    in-flight tools; autopilot returns the wrapped `context.DeadlineExceeded` /
+    `context.Canceled` error.
+ 
++### Report-only turn
++
++When a run is *stopped* rather than *finished* — the stall guard tripping (see
++[Stall detection and section budgets](#stall-detection-and-section-budgets)) or
++the engine giving up on its own (item 2) — and nothing has been reported yet,
++the loop grants exactly one more turn before accepting the stop. The engine
++context is reset and the operator receives a report-only mission that names the
++durable evidence (the run's `transcript.jsonl`, the spilled `tool-results/`,
++the scratchpad) and requires `report_finding` for everything actually verified,
++followed by the `findings.json` / `dismissed.json` artifacts.
++
++This exists because a stopped run used to end with whatever the operator had
++already reported — nothing, when its verification happened through `bash` (see
++the progress definition below). The turn is skipped when the stop was
++budget-driven (the cap behind it is already spent), when at least one finding
++was already reported, and when the caller sets `Options.NoFinalReportTurn`.
++
++Two properties make the turn actually usable:
++
++- It is **exempt from the stall guard** (the same progress definition below) —
++  recovering evidence by reading the transcript looks unproductive, and without
++  the exemption the guard killed the rescue after a single read.
++- It is the run's **last act**: when it reaches a section limit the run ends
++  rather than rotating into a fresh mission that drops the report instruction.
++
++The `findings.json` / `dismissed.json` artifacts are synthesized **after**
++verify-before-promote and triage, so the file reflects the run's judged
++findings rather than the state before those stages ran.
++
+ A separate **finding rate-limit** lives inside `report_finding`:
+ - soft warning at 50 findings (still saved)
+ - hard cap at 200 (rejected with an `IsError` result that nudges the model
+@@ -249,6 +278,37 @@ A separate **finding rate-limit** lives inside `report_finding`:
+ 
+ ---
+ 
++## Stall detection and section budgets
++
++`autopilot_mode: shadow|enforced` runs the operator in bounded **sections**: a
++fresh context every `MaxTurnsPerSection` turns, or sooner when the operator
++stops making progress. "Progress" is deliberately narrow — only tools that touch
++the target or record a result count:
++
++`run_native_scan`, `run_extension`, `run_module`, `browser_probe`, `web_fetch`,
++`replay_request`, `send_raw_http`, `browser_auth`, `report_finding`,
++`propose_candidate`.
++
++Everything else — `bash`, `read_file`, `grep`, `query_records`,
++`list_findings`, `auth_session_lookup`, `update_plan`, `remember` — is
++inspection or bookkeeping, so reading source, querying the target's database
++through `bash`, or replaying a request by hand counts as *no* progress even when
++it is exactly how a bug gets verified.
++
++| Setting | Default | Effect |
++| --- | --- | --- |
++| `agent.olium.section_max_turns` | 40 | Turns before a section rotates unconditionally. |
++| `agent.olium.stall_turns` | 12 | Consecutive turns with no productive tool call that end a section. |
++| `agent.olium.stall_rotations` | 3 | Consecutive stall rotations tolerated before the run is stopped instead of rotated again. |
++
++A run stopped by the rotation limit is not finished: it takes the
++[report-only turn](#report-only-turn) described above, so verified work still
++lands as findings. Raise `stall_turns` / `stall_rotations` on codebases that
++reward manual verification over tool-driven probing. The knobs are no-ops for
++`legacy` runs, which never rotate.
++
++---
++
+ ## Findings persistence
+ 
+ Every successful `report_finding` call writes a row via
+diff --git a/internal/config/agent.go b/internal/config/agent.go
+index aa4018d9..187abe00 100644
+--- a/internal/config/agent.go
++++ b/internal/config/agent.go
+@@ -91,6 +91,24 @@ type OliumConfig struct {
+ 	//     propose_candidate; only verified candidates become findings).
+ 	// Empty or any unrecognized value resolves to "legacy" via EffectiveAutopilotMode.
+ 	AutopilotMode string `yaml:"autopilot_mode"`
++
++	// SectionMaxTurns caps how many model turns one durable-autopilot section
++	// may take before the loop rotates to a fresh context (shadow / enforced
++	// modes only). 0 = package default 40.
++	SectionMaxTurns int `yaml:"section_max_turns"`
++	// StallTurns is how many consecutive turns without a productive tool call
++	// end a section. The progress detector only counts target-touching or
++	// result-recording tools (run_native_scan, web_fetch, send_raw_http,
++	// browser_probe, report_finding, ...), so an operator that verifies through
++	// bash — reading source, querying the target's database, replaying a
++	// request by hand — reads as stalled. Raise it on codebases that reward
++	// manual probing. 0 = package default 12.
++	StallTurns int `yaml:"stall_turns"`
++	// StallRotations is how many consecutive stall rotations are tolerated
++	// before a run is stopped rather than rotated again. 0 = package default 3.
++	// A run stopped this way still gets one report-only turn before the loop
++	// accepts the stop (see pkg/olium/autopilot.Options.NoFinalReportTurn).
++	StallRotations int `yaml:"stall_rotations"`
+ }
+ 
+ // Autopilot mode constants for OliumConfig.AutopilotMode. Exported so callers
+@@ -684,6 +702,13 @@ func DefaultOliumConfig() OliumConfig {
+ 		CacheSize:       1024,
+ 		MaxConcurrent:   4,
+ 		CallTimeoutSec:  600, // 10 minutes per provider call
++
++		// Durable-autopilot section budgets; mirrored by the package defaults
++		// in pkg/olium/autopilot (section.go) so a bare Options{} behaves the
++		// same as a fully populated config.
++		SectionMaxTurns: 40,
++		StallTurns:      12,
++		StallRotations:  3,
+ 		CustomProvider: CustomProviderConfig{
+ 			BaseURL: "http://localhost:11434/v1",
+ 			ModelID: "gemma4:latest",
+diff --git a/internal/config/agent_test.go b/internal/config/agent_test.go
+index 94c34a01..6ba00ed3 100644
+--- a/internal/config/agent_test.go
++++ b/internal/config/agent_test.go
+@@ -76,6 +76,7 @@ func TestDefaultAgentConfig_Olium(t *testing.T) {
+ 		"google_cloud_project", "google_cloud_location",
+ 		"reasoning_effort", "system_prompt", "max_tokens", "temperature",
+ 		"max_turns", "cache_size",
++		"section_max_turns", "stall_turns", "stall_rotations",
+ 	} {
+ 		if !oliumKeys[want] {
+ 			t.Errorf("expected agent.olium.%s to appear in flattened config (visible in `vigolium config ls olium`)", want)
+diff --git a/pkg/agent/autopilot_artifact_synthesis_test.go b/pkg/agent/autopilot_artifact_synthesis_test.go
+new file mode 100644
+index 00000000..4f24bf5e
+--- /dev/null
++++ b/pkg/agent/autopilot_artifact_synthesis_test.go
+@@ -0,0 +1,192 @@
++package agent
++
++import (
++	"context"
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/google/uuid"
++
++	"github.com/vigolium/vigolium/pkg/database"
++)
++
++// readArtifactRows reads a findings/dismissed artifact as a JSON array.
++func readArtifactRows(t *testing.T, path string) []map[string]any {
++	t.Helper()
++	data, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatalf("read %s: %v", path, err)
++	}
++	var rows []map[string]any
++	if err := json.Unmarshal(data, &rows); err != nil {
++		t.Fatalf("parse %s as a JSON array: %v (content %q)", path, err, string(data))
++	}
++	return rows
++}
++
++// TestSynthesizeAutopilotFindingArtifactsFromDB locks the second half of the
++// regression: two autopilot runs ended completed_with_warnings with
++// "artifact missing: findings.json" while the judged rows sat in the project
++// DB. Synthesis must derive both artifacts from the run tree (the run plus the
++// child audit run it spawned), keep draft rows out, and carry the evidence
++// columns the verifier keys on.
++func TestSynthesizeAutopilotFindingArtifactsFromDB(t *testing.T) {
++	repo := newAuditTestRepo(t)
++	ctx := context.Background()
++
++	dir := t.TempDir()
++	spec := AutopilotArtifactSpec{
++		FindingsPath:  filepath.Join(dir, "findings.json"),
++		DismissedPath: filepath.Join(dir, "dismissed.json"),
++		EvidenceDir:   filepath.Join(dir, "evidence"),
++	}
++
++	project := database.DefaultProjectUUID
++	run := uuid.NewString()
++	child := uuid.NewString()
++	createRun(t, repo, run, "")
++	createRun(t, repo, child, run)
++
++	save := func(hash, agenticScan, status string) {
++		t.Helper()
++		f := &database.Finding{
++			FindingHash:     hash,
++			ProjectUUID:     project,
++			AgenticScanUUID: agenticScan,
++			Status:          status,
++			Severity:        database.SeverityHigh,
++			Request:         "GET /api/customers HTTP/1.1\nHost: app.example.com\n\n",
++			Response:        "HTTP/1.1 200 OK\n\n[...]",
++		}
++		if err := repo.SaveFindingDirect(ctx, f); err != nil {
++			t.Fatalf("save finding %s: %v", hash, err)
++		}
++	}
++	save("run-triaged", run, database.StatusTriaged)
++	save("child-confirmed", child, database.StatusConfirmed)
++	save("run-dismissed", run, database.StatusFalsePositive)
++	save("child-draft", child, database.StatusDraft)
++
++	synth, err := synthesizeAutopilotFindingArtifacts(ctx, repo, spec, project, run, "")
++	if err != nil {
++		t.Fatalf("synthesize: %v", err)
++	}
++	if !synth.Findings || !synth.Dismissed {
++		t.Fatalf("both artifacts should be synthesized, got %+v", synth)
++	}
++
++	confirmed := readArtifactRows(t, spec.FindingsPath)
++	if len(confirmed) != 2 {
++		t.Fatalf("findings.json = %d entries, want 2 (run + child run): %v", len(confirmed), confirmed)
++	}
++	dismissed := readArtifactRows(t, spec.DismissedPath)
++	if len(dismissed) != 1 {
++		t.Fatalf("dismissed.json = %d entries, want 1: %v", len(dismissed), dismissed)
++	}
++	if got := dismissed[0]["finding_hash"]; got != "run-dismissed" {
++		t.Errorf("dismissed.json entry = %v, want run-dismissed", got)
++	}
++	for _, row := range confirmed {
++		if row["finding_hash"] == "child-draft" {
++			t.Error("draft (unjudged) finding must not appear in findings.json")
++		}
++		if row["request"] == "" || row["request"] == nil {
++			t.Errorf("entry %v lost its request evidence", row["finding_hash"])
++		}
++	}
++
++	// The verifier must count the synthesized rows and record the provenance.
++	report := verifyAutopilotArtifacts(spec, synth)
++	if report.ConfirmedCount != 2 || report.DismissedCount != 1 {
++		t.Errorf("verification counts = (%d,%d), want (2,1)",
++			report.ConfirmedCount, report.DismissedCount)
++	}
++	if !report.FindingsSynthesized || !report.DismissedSynthesized {
++		t.Errorf("verification should record synthesis, got %+v", report)
++	}
++	for _, w := range report.Warnings {
++		if w == "artifact missing: findings.json" || w == "artifact missing: dismissed.json" {
++			t.Errorf("synthesized artifacts must not be reported missing: %v", report.Warnings)
++		}
++	}
++}
++
++// TestSynthesizeAutopilotFindingArtifactsPreservesOperatorFile locks the
++// precedence rule: an operator-authored artifact is never overwritten, while a
++// genuinely absent one with no matching rows is written as `[]` so readers see
++// an empty verdict rather than a missing file.
++func TestSynthesizeAutopilotFindingArtifactsPreservesOperatorFile(t *testing.T) {
++	repo := newAuditTestRepo(t)
++	ctx := context.Background()
++
++	dir := t.TempDir()
++	spec := AutopilotArtifactSpec{
++		FindingsPath:  filepath.Join(dir, "findings.json"),
++		DismissedPath: filepath.Join(dir, "dismissed.json"),
++		EvidenceDir:   filepath.Join(dir, "evidence"),
++	}
++
++	project := database.DefaultProjectUUID
++	run := uuid.NewString()
++	createRun(t, repo, run, "")
++	if err := repo.SaveFindingDirect(ctx, &database.Finding{
++		FindingHash:     "run-triaged",
++		ProjectUUID:     project,
++		AgenticScanUUID: run,
++		Status:          database.StatusTriaged,
++		Severity:        database.SeverityHigh,
++		Request:         "GET / HTTP/1.1\n\n",
++	}); err != nil {
++		t.Fatalf("save finding: %v", err)
++	}
++
++	const operatorContent = `[{"title":"operator verdict","evidence":"poc.md"}]`
++	if err := os.WriteFile(spec.FindingsPath, []byte(operatorContent), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	synth, err := synthesizeAutopilotFindingArtifacts(ctx, repo, spec, project, run, "")
++	if err != nil {
++		t.Fatalf("synthesize: %v", err)
++	}
++	if synth.Findings {
++		t.Error("an operator-authored findings.json must not be reported as synthesized")
++	}
++	if !synth.Dismissed {
++		t.Error("the absent dismissed.json should still be synthesized")
++	}
++
++	got, err := os.ReadFile(spec.FindingsPath)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if string(got) != operatorContent {
++		t.Errorf("operator-authored findings.json was modified: %q", string(got))
++	}
++	if rows := readArtifactRows(t, spec.DismissedPath); len(rows) != 0 {
++		t.Errorf("dismissed.json = %v, want []", rows)
++	}
++}
++
++// TestSynthesizeAutopilotFindingArtifactsNoRepoIsNoop guards the degraded
++// paths: without a repo or project there is nothing authoritative to read, so
++// synthesis must not invent empty artifacts.
++func TestSynthesizeAutopilotFindingArtifactsNoRepoIsNoop(t *testing.T) {
++	dir := t.TempDir()
++	spec := AutopilotArtifactSpec{
++		FindingsPath:  filepath.Join(dir, "findings.json"),
++		DismissedPath: filepath.Join(dir, "dismissed.json"),
++	}
++	synth, err := synthesizeAutopilotFindingArtifacts(context.Background(), nil, spec, "project", "run", "")
++	if err != nil {
++		t.Fatalf("synthesize: %v", err)
++	}
++	if synth.Findings || synth.Dismissed {
++		t.Errorf("nil repo should synthesize nothing, got %+v", synth)
++	}
++	if _, err := os.Stat(spec.FindingsPath); !os.IsNotExist(err) {
++		t.Error("nil repo must not write findings.json")
++	}
++}
+diff --git a/pkg/agent/autopilot_auth.go b/pkg/agent/autopilot_auth.go
+index 6065b9dd..f089b9d6 100644
+--- a/pkg/agent/autopilot_auth.go
++++ b/pkg/agent/autopilot_auth.go
+@@ -163,7 +163,7 @@ func normalizeAutopilotSessionConfig(ctx context.Context, engine *Engine, cfg *A
+ 		if repaired != nil {
+ 			vr.Valid = append(vr.Valid, repaired.Sessions...)
+ 		} else {
+-			*warnings = append(*warnings, "some discovered auth sessions were invalid and could not be repaired")
++			*warnings = append(*warnings, formatInvalidSessionWarning(vr.Invalid, vr.Valid))
+ 		}
+ 	}
+ 	if len(vr.Valid) == 0 {
+@@ -172,6 +172,49 @@ func normalizeAutopilotSessionConfig(ctx context.Context, engine *Engine, cfg *A
+ 	return &AgentSessionConfig{Sessions: vr.Valid}
+ }
+ 
++// invalidSessionWarningPrefix is the stable leading phrase of the warning
++// emitted when discovered sessions cannot be repaired. Callers and operators
++// grep for it, so the detail appended by formatInvalidSessionWarning is added
++// after the em dash rather than folded into the phrase.
++const invalidSessionWarningPrefix = "some discovered auth sessions were invalid and could not be repaired"
++
++// formatInvalidSessionWarning renders the unrepairable-session warning with the
++// detail the operator actually needs: which entries were dropped and why, and
++// which session names survive. Without the names the operator sees only an
++// opaque failure and burns its run guessing (`auth_session_lookup` against
++// names that were never configured) instead of using the sessions that exist.
++func formatInvalidSessionWarning(invalid []authsession.InvalidSessionEntry, valid []AgentSessionEntry) string {
++	dropped := make([]string, 0, len(invalid))
++	for _, inv := range invalid {
++		name := strings.TrimSpace(inv.Entry.Name)
++		if name == "" {
++			name = "(unnamed)"
++		}
++		errs := strings.Join(inv.Errors, "; ")
++		if errs == "" {
++			errs = "failed validation"
++		}
++		dropped = append(dropped, fmt.Sprintf("%s (%s)", name, errs))
++	}
++	usable := "none"
++	if names := agentSessionNames(valid); len(names) > 0 {
++		usable = strings.Join(names, ", ")
++	}
++	return fmt.Sprintf("%s — dropped: %s; usable: %s",
++		invalidSessionWarningPrefix, strings.Join(dropped, "; "), usable)
++}
++
++// agentSessionNames returns the non-empty session names in declaration order.
++func agentSessionNames(sessions []AgentSessionEntry) []string {
++	names := make([]string, 0, len(sessions))
++	for _, s := range sessions {
++		if n := strings.TrimSpace(s.Name); n != "" {
++			names = append(names, n)
++		}
++	}
++	return names
++}
++
+ func (r *AutopilotPipelineRunner) prepareBrowserAuth(ctx context.Context, cfg AutopilotPipelineConfig) (*AgentSessionConfig, map[string]string, string, error) {
+ 	if cfg.SessionDir == "" {
+ 		return nil, nil, "", fmt.Errorf("session dir is required for browser auth preflight")
+diff --git a/pkg/agent/autopilot_auth_warning_test.go b/pkg/agent/autopilot_auth_warning_test.go
+new file mode 100644
+index 00000000..7e3f0e7a
+--- /dev/null
++++ b/pkg/agent/autopilot_auth_warning_test.go
+@@ -0,0 +1,119 @@
++package agent
++
++import (
++	"context"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/vigolium/vigolium/pkg/agent/authsession"
++)
++
++// TestNormalizeAutopilotSessionConfigWarningNamesDroppedAndUsable locks the
++// regression behind the opaque "some discovered auth sessions were invalid and
++// could not be repaired" warning: the operator was told nothing about which
++// sessions exist, so it guessed names (`admin_backend`) that were never
++// configured and burned its run on failing lookups. A nil engine models the
++// unrepairable path (the repair LLM is unavailable).
++func TestNormalizeAutopilotSessionConfigWarningNamesDroppedAndUsable(t *testing.T) {
++	cfg := &AutopilotPipelineConfig{}
++	sessionCfg := &AgentSessionConfig{Sessions: []AgentSessionEntry{
++		{Name: "admin_api", Role: "compare", Headers: map[string]string{"Authorization": "Basic YWRtaW4="}},
++		{Name: "lowpriv_api", Role: "compare", Headers: map[string]string{"Authorization": "Basic bG93"}},
++		{Name: "admin_backend", Role: "backend", Headers: map[string]string{"Cookie": "BE=xyz"}},
++	}}
++
++	var warnings []string
++	got := normalizeAutopilotSessionConfig(context.Background(), nil, cfg, sessionCfg, "", &warnings)
++	if got == nil || len(got.Sessions) != 2 {
++		t.Fatalf("expected the two valid sessions to survive, got %+v", got)
++	}
++	if len(warnings) != 1 {
++		t.Fatalf("expected exactly one warning, got %v", warnings)
++	}
++
++	w := warnings[0]
++	if !strings.HasPrefix(w, invalidSessionWarningPrefix) {
++		t.Errorf("warning must keep its leading phrase, got %q", w)
++	}
++	const want = `some discovered auth sessions were invalid and could not be repaired — dropped: admin_backend (role must be "primary" or "compare", got: backend); usable: admin_api, lowpriv_api`
++	if w != want {
++		t.Errorf("warning =\n%q\nwant\n%q", w, want)
++	}
++	for _, part := range []string{
++		`dropped: admin_backend (role must be "primary" or "compare"`,
++		"usable: admin_api, lowpriv_api",
++	} {
++		if !strings.Contains(w, part) {
++			t.Errorf("warning %q missing %q", w, part)
++		}
++	}
++}
++
++// TestFormatInvalidSessionWarningReportsUnnamedEntry covers the empty-name
++// case: the detail must still name the entry rather than render "()".
++func TestFormatInvalidSessionWarningReportsUnnamedEntry(t *testing.T) {
++	w := formatInvalidSessionWarning([]authsession.InvalidSessionEntry{
++		{Entry: AgentSessionEntry{Name: "  ", Role: "backend"}},
++	}, nil)
++	if !strings.Contains(w, "dropped: (unnamed)") {
++		t.Errorf("unnamed entry should be labelled, got %q", w)
++	}
++	if !strings.Contains(w, "usable: none") {
++		t.Errorf("no surviving sessions should read as none, got %q", w)
++	}
++}
++
++// TestBriefListsUsableSessionsAndUncapturedBrowser locks change 1's brief
++// contract: both prompt shapes name the sessions that exist, and a
++// browser-driven plan with no captured browser session says so and points at
++// browser_auth.
++func TestBriefListsUsableSessionsAndUncapturedBrowser(t *testing.T) {
++	dir := t.TempDir()
++	browserPath := filepath.Join(dir, "browser-session.json")
++	if err := os.WriteFile(browserPath, []byte(`{"status":"pending"}`), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	prepared := &AutopilotPreparedAuth{Requested: true, Source: "source-analysis", SessionCount: 2}
++	cfg := AutopilotPipelineConfig{
++		TargetURL: "https://app.example.com",
++		SessionConfig: &AgentSessionConfig{Sessions: []AgentSessionEntry{
++			{Name: "admin_api", Role: "compare", Headers: map[string]string{"Authorization": "Basic x"}},
++			{Name: "lowpriv_api", Role: "compare", Headers: map[string]string{"Authorization": "Basic y"}},
++		}},
++		PreparedAuth: prepared,
++		ContextBundle: &AutopilotContextBundle{
++			BrowserDecision: "browser_recommended",
++			PreparedAuth:    prepared,
++		},
++		Artifacts: AutopilotArtifactSpec{BrowserSessionPath: browserPath},
++	}
++
++	const (
++		sessionsLine = "- Usable auth sessions: admin_api, lowpriv_api"
++		browserLine  = "browser session not captured — call `browser_auth` before probing authenticated routes."
++	)
++	for name, prompt := range map[string]string{
++		"target": buildTargetPrompt(cfg, nil, false),
++		"source": buildSourceOnlyPrompt(cfg, nil, false),
++	} {
++		if !strings.Contains(prompt, sessionsLine) {
++			t.Errorf("%s prompt missing %q", name, sessionsLine)
++		}
++		if !strings.Contains(prompt, browserLine) {
++			t.Errorf("%s prompt missing %q", name, browserLine)
++		}
++	}
++
++	// A populated browser-session artifact means a session was captured: the
++	// note must disappear so it does not send the operator to browser_auth
++	// for state it already has.
++	if err := os.WriteFile(browserPath, []byte(`{"status":"captured"}`), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	if strings.Contains(buildTargetPrompt(cfg, nil, false), browserLine) {
++		t.Error("captured browser session should not emit the not-captured note")
++	}
++}
+diff --git a/pkg/agent/autopilot_context.go b/pkg/agent/autopilot_context.go
+index a69c5704..f334273b 100644
+--- a/pkg/agent/autopilot_context.go
++++ b/pkg/agent/autopilot_context.go
+@@ -1,13 +1,18 @@
+ package agent
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"fmt"
+ 	"os"
+ 	"path/filepath"
++	"slices"
+ 	"strings"
+ 
++	"github.com/uptrace/bun"
+ 	"github.com/vigolium/vigolium/pkg/audit"
++	"github.com/vigolium/vigolium/pkg/database"
++	"go.uber.org/zap"
+ )
+ 
+ type AutopilotContextBundle struct {
+@@ -106,6 +111,20 @@ type AutopilotVerificationReport struct {
+ 	ConfirmedCount int      `json:"confirmed_count"`
+ 	DismissedCount int      `json:"dismissed_count"`
+ 	Warnings       []string `json:"warnings,omitempty"`
++	// FindingsSynthesized / DismissedSynthesized record that the artifact was
++	// absent when the operator finished and was therefore derived from the
++	// project DB. They make the provenance of a count legible in
++	// verification.json: a synthesized 9 and an operator-written 9 mean
++	// different things to whoever reads the run afterwards.
++	FindingsSynthesized  bool `json:"findings_synthesized,omitempty"`
++	DismissedSynthesized bool `json:"dismissed_synthesized,omitempty"`
++}
++
++// AutopilotArtifactSynthesis reports which operator artifacts the runner had to
++// derive from the project DB because the operator left them absent.
++type AutopilotArtifactSynthesis struct {
++	Findings  bool
++	Dismissed bool
+ }
+ 
+ func buildAutopilotContextBundle(cfg AutopilotPipelineConfig, ac *auditContextStruct, auditStatus string, warnings []string) AutopilotContextBundle {
+@@ -470,8 +489,162 @@ func writeAutopilotArtifacts(spec AutopilotArtifactSpec, bundle AutopilotContext
+ 	return writeJSONArtifact(spec.ArtifactsPath, manifest)
+ }
+ 
+-func verifyAutopilotArtifacts(spec AutopilotArtifactSpec) AutopilotVerificationReport {
+-	report := AutopilotVerificationReport{}
++// autopilotFindingStatuses / autopilotDismissedStatuses partition the judged
++// lifecycle statuses into the two artifact files. `draft` is deliberately in
++// neither: an unjudged row has had no verdict, so writing it as a finding or a
++// dismissal would invent a decision nobody made.
++var (
++	autopilotFindingStatuses   = []string{database.StatusConfirmed, database.StatusTriaged}
++	autopilotDismissedStatuses = []string{database.StatusFalsePositive, database.StatusAcceptedRisk}
++)
++
++// artifactFindingScope is the DB scope artifact synthesis reads: the run's
++// project, the agentic-scan uuids of the run tree, and any scan uuids the
++// findings may carry instead of an agentic-scan link.
++type artifactFindingScope struct {
++	projectUUID string
++	runUUIDs    []string
++	scanUUIDs   []string
++}
++
++// synthesizeAutopilotFindingArtifacts writes findings.json and dismissed.json
++// from the project DB when the operator left them absent. The artifacts are
++// derived views of the run's findings, not an independent obligation on the
++// model: two consecutive autopilot runs finished with their verified rows in
++// the DB and both artifacts missing, so verifyAutopilotArtifacts reported
++// "artifact missing" on runs that had done the work.
++//
++// Scope is the run itself plus every child run (the audit leg and native scans
++// it spawned) and the run's own scan uuid. Confirmed/triaged rows land in
++// findings.json, false_positive/accepted_risk in dismissed.json, draft rows are
++// unjudged and stay out. An empty run uuid falls back to project scope, exactly
++// as the triage writeback scopes when the pipeline has no run id. An artifact
++// the operator wrote is never overwritten — a present file wins — and an absent
++// one with no matching rows is written as `[]` so downstream readers see an
++// empty verdict, not a missing file.
++func synthesizeAutopilotFindingArtifacts(ctx context.Context, repo *database.Repository, spec AutopilotArtifactSpec, projectUUID, runUUID, scanUUID string) (AutopilotArtifactSynthesis, error) {
++	var synth AutopilotArtifactSynthesis
++	if repo == nil || projectUUID == "" {
++		return synth, nil
++	}
++	writeFindings := artifactAbsent(spec.FindingsPath)
++	writeDismissed := artifactAbsent(spec.DismissedPath)
++	if !writeFindings && !writeDismissed {
++		return synth, nil
++	}
++
++	scope := artifactFindingScope{projectUUID: projectUUID}
++	if runUUID != "" {
++		scope.runUUIDs = append(scope.runUUIDs, runUUID)
++		children, err := repo.GetChildAgenticScans(ctx, runUUID)
++		if err != nil {
++			// Non-fatal: fall back to the run's own uuid, exactly as the triage
++			// writeback does when the child lookup fails.
++			zap.L().Warn("artifact synthesis: child run lookup failed; scoping to the run's own uuid",
++				zap.String("agentic_scan_uuid", runUUID), zap.Error(err))
++		} else {
++			for _, child := range children {
++				if child.UUID != "" {
++					scope.runUUIDs = append(scope.runUUIDs, child.UUID)
++				}
++			}
++		}
++	}
++	if scanUUID != "" {
++		scope.scanUUIDs = append(scope.scanUUIDs, scanUUID)
++	}
++
++	findings, err := loadAutopilotArtifactFindings(ctx, repo, scope)
++	if err != nil {
++		return synth, err
++	}
++	confirmed := make([]*database.Finding, 0, len(findings))
++	dismissed := make([]*database.Finding, 0, len(findings))
++	for _, f := range findings {
++		if slices.Contains(autopilotDismissedStatuses, f.Status) {
++			dismissed = append(dismissed, f)
++		} else {
++			confirmed = append(confirmed, f)
++		}
++	}
++
++	if writeFindings {
++		if err := writeJSONArtifact(spec.FindingsPath, confirmed); err != nil {
++			return synth, fmt.Errorf("write synthesized findings artifact: %w", err)
++		}
++		synth.Findings = true
++		zap.L().Info("synthesized findings.json from the project DB (operator left it absent)",
++			zap.String("path", spec.FindingsPath),
++			zap.Int("findings", len(confirmed)),
++			zap.Strings("run_uuids", scope.runUUIDs))
++	}
++	if writeDismissed {
++		if err := writeJSONArtifact(spec.DismissedPath, dismissed); err != nil {
++			return synth, fmt.Errorf("write synthesized dismissed artifact: %w", err)
++		}
++		synth.Dismissed = true
++		zap.L().Info("synthesized dismissed.json from the project DB (operator left it absent)",
++			zap.String("path", spec.DismissedPath),
++			zap.Int("dismissed", len(dismissed)),
++			zap.Strings("run_uuids", scope.runUUIDs))
++	}
++	return synth, nil
++}
++
++// artifactAbsent reports whether path names a file that does not exist yet.
++// Any other stat error counts as "present" so a permissions problem never
++// clobbers a file that may already hold the operator's content.
++func artifactAbsent(path string) bool {
++	if path == "" {
++		return false
++	}
++	_, err := os.Stat(path)
++	return os.IsNotExist(err)
++}
++
++// loadAutopilotArtifactFindings reads the run's judged findings with their
++// request/response evidence columns. The plain findings query excludes those
++// body columns, and countEvidenceBackedFindings keys on them — a synthesized
++// entry that carried no evidence would be reported as evidence-free even
++// though the row it came from has it.
++func loadAutopilotArtifactFindings(ctx context.Context, repo *database.Repository, scope artifactFindingScope) ([]*database.Finding, error) {
++	statuses := make([]string, 0, len(autopilotFindingStatuses)+len(autopilotDismissedStatuses))
++	statuses = append(statuses, autopilotFindingStatuses...)
++	statuses = append(statuses, autopilotDismissedStatuses...)
++
++	findings := make([]*database.Finding, 0)
++	q := repo.DB().NewSelect().Model(&findings).
++		Where("f.project_uuid = ?", scope.projectUUID).
++		Where("(f.record_kind IS NULL OR f.record_kind = '' OR f.record_kind = ?)", database.RecordKindFinding).
++		Where("f.status IN (?)", bun.List(statuses))
++	if len(scope.runUUIDs) > 0 || len(scope.scanUUIDs) > 0 {
++		q = q.WhereGroup("AND", func(sq *bun.SelectQuery) *bun.SelectQuery {
++			wrote := false
++			if len(scope.runUUIDs) > 0 {
++				sq = sq.Where("f.agentic_scan_uuid IN (?)", bun.List(scope.runUUIDs))
++				wrote = true
++			}
++			if len(scope.scanUUIDs) > 0 {
++				if wrote {
++					sq = sq.WhereOr("f.scan_uuid IN (?)", bun.List(scope.scanUUIDs))
++				} else {
++					sq = sq.Where("f.scan_uuid IN (?)", bun.List(scope.scanUUIDs))
++				}
++			}
++			return sq
++		})
++	}
++	if err := q.OrderExpr("f.id ASC").Scan(ctx); err != nil {
++		return nil, fmt.Errorf("load findings for artifact synthesis: %w", err)
++	}
++	return findings, nil
++}
++
++func verifyAutopilotArtifacts(spec AutopilotArtifactSpec, synth AutopilotArtifactSynthesis) AutopilotVerificationReport {
++	report := AutopilotVerificationReport{
++		FindingsSynthesized:  synth.Findings,
++		DismissedSynthesized: synth.Dismissed,
++	}
+ 	confirmed, confirmedWarn := countEvidenceBackedFindings(spec.FindingsPath, spec.EvidenceDir)
+ 	report.ConfirmedCount = confirmed
+ 	if confirmedWarn != "" {
+@@ -526,7 +699,11 @@ func countEvidenceBackedFindings(path string, evidenceDir string) (int, string)
+ }
+ 
+ func hasEvidence(item map[string]any, evidenceDir string) bool {
+-	for _, key := range []string{"evidence", "evidence_path", "request", "response"} {
++	// HTTP-shaped evidence (bodies, stored payloads) plus the provenance a
++	// whitebox finding actually has: the file it was found in. Without
++	// source_file an audit finding — whose evidence IS its location, and which
++	// carries no request/response — would be counted as evidence-free.
++	for _, key := range []string{"evidence", "evidence_path", "request", "response", "source_file"} {
+ 		if v, ok := item[key]; ok && strings.TrimSpace(fmt.Sprint(v)) != "" {
+ 			return true
+ 		}
+diff --git a/pkg/agent/autopilot_pipeline.go b/pkg/agent/autopilot_pipeline.go
+index 86869b60..809524b7 100644
+--- a/pkg/agent/autopilot_pipeline.go
++++ b/pkg/agent/autopilot_pipeline.go
+@@ -64,6 +64,14 @@ type AutopilotPipelineConfig struct {
+ 	// Zero = no cap.
+ 	TokenBudget int64
+ 	MaxCostUSD  float64
++	// SectionMaxTurns / StallTurns / StallRotations tune the durable-autopilot
++	// section controller (agent.olium.section_max_turns / stall_turns /
++	// stall_rotations; shadow+enforced modes only). Zero falls back to the
++	// package defaults — 40 turns, 12 stalled turns, 3 stall rotations. See
++	// pkg/olium/autopilot/rotation.go for what counts as progress.
++	SectionMaxTurns int
++	StallTurns      int
++	StallRotations  int
+ 	// SkipPreflight skips the provider ping (--no-preflight).
+ 	SkipPreflight bool
+ 
+@@ -447,6 +455,9 @@ func (r *AutopilotPipelineRunner) RunAutonomous(ctx context.Context, cfg Autopil
+ 		SessionDir:           cfg.SessionDir,
+ 		MaxToolCalls:         cfg.MaxCommands,
+ 		MaxTurns:             cfg.MaxCommands,
++		MaxTurnsPerSection:   cfg.SectionMaxTurns,
++		StallTurns:           cfg.StallTurns,
++		MaxStallRotations:    cfg.StallRotations,
+ 		TokenBudget:          cfg.TokenBudget,
+ 		MaxCostUSD:           cfg.MaxCostUSD,
+ 		Out:                  streamWriter,
+@@ -493,13 +504,6 @@ func (r *AutopilotPipelineRunner) RunAutonomous(ctx context.Context, cfg Autopil
+ 		}
+ 	}
+ 
+-	verification := verifyAutopilotArtifacts(spec)
+-	result.VerifiedFindingCount = verification.ConfirmedCount
+-	result.Warnings = append(result.Warnings, verification.Warnings...)
+-	if len(result.Warnings) > 0 {
+-		result.Degraded = true
+-	}
+-
+ 	// Durable-autopilot verify-before-promote: in shadow/enforced mode, re-check
+ 	// each proposed candidate with a fresh-context skeptic verifier and promote
+ 	// only the confirmed ones into findings. No-op in legacy (the default), so
+@@ -547,6 +551,29 @@ func (r *AutopilotPipelineRunner) RunAutonomous(ctx context.Context, cfg Autopil
+ 		}
+ 	}
+ 
++	// Derive findings.json / dismissed.json from the project DB when the
++	// operator left them absent. The artifacts are views of the rows this run
++	// already produced, so a run that did the work but reported nothing to the
++	// artifact is no longer degraded for it — and an operator-written file is
++	// never touched. Synthesis logs one line per file it writes.
++	//
++	// Deliberately after verify-before-promote and triage: both stages create
++	// or re-judge rows (promoted candidates, triage verdicts on the run's and
++	// its child runs' findings), and an artifact written before them would
++	// snapshot the run as emptier than it ended.
++	synthesis, synthErr := synthesizeAutopilotFindingArtifacts(ctx, r.repo, spec, cfg.ProjectUUID, cfg.ParentAgenticScanUUID, cfg.ScanUUID)
++	if synthErr != nil {
++		zap.L().Warn("failed to synthesize finding artifacts from the project DB", zap.Error(synthErr))
++		result.Warnings = append(result.Warnings, fmt.Sprintf("failed to synthesize finding artifacts from the project DB: %v", synthErr))
++	}
++
++	verification := verifyAutopilotArtifacts(spec, synthesis)
++	result.VerifiedFindingCount = verification.ConfirmedCount
++	result.Warnings = append(result.Warnings, verification.Warnings...)
++	if len(result.Warnings) > 0 {
++		result.Degraded = true
++	}
++
+ 	emitProgress(&cfg, "autopilot", "autonomous session completed")
+ 	result.Duration = time.Since(start)
+ 	return result, nil
+@@ -1074,10 +1101,17 @@ func writeCommonSections(b *strings.Builder, cfg AutopilotPipelineConfig, ac *au
+ 			if cfg.ContextBundle.PreparedAuth.SessionConfig != "" {
+ 				fmt.Fprintf(b, "- Session config artifact: `%s`\n", cfg.ContextBundle.PreparedAuth.SessionConfig)
+ 			}
++			if names := usableSessionNames(cfg); len(names) > 0 {
++				fmt.Fprintf(b, "- Usable auth sessions: %s\n", strings.Join(names, ", "))
++				b.WriteString("  - Those are the only session names that exist; `auth_session_lookup` rejects any other name.\n")
++			}
+ 			if len(cfg.ContextBundle.PreparedAuth.FocusRoutes) > 0 {
+ 				fmt.Fprintf(b, "- Focus routes: %s\n", strings.Join(cfg.ContextBundle.PreparedAuth.FocusRoutes, ", "))
+ 			}
+ 		}
++		if browserSessionUncaptured(cfg) {
++			b.WriteString("\n- browser session not captured — call `browser_auth` before probing authenticated routes.\n")
++		}
+ 		b.WriteString("\n")
+ 	}
+ 
+@@ -1162,6 +1196,63 @@ func writeCommonSections(b *strings.Builder, cfg AutopilotPipelineConfig, ac *au
+ 	}
+ }
+ 
++// usableSessionNames returns the names of the sessions this run actually
++// prepared. normalizeAutopilotSessionConfig drops entries it cannot validate,
++// so the names the brief lists are the complete, authoritative set — an
++// operator that never sees them guesses (`admin_backend`) and burns its run on
++// lookups that can only fail.
++func usableSessionNames(cfg AutopilotPipelineConfig) []string {
++	if cfg.SessionConfig == nil {
++		return nil
++	}
++	return agentSessionNames(cfg.SessionConfig.Sessions)
++}
++
++// browserSessionUncaptured reports whether the run's browser policy expects a
++// browser session that was never captured. Shipping browser-derived state is a
++// preflight outcome: when neither the preflight (source browser-auth) nor the
++// operator (a populated browser-session artifact) produced one, the brief has
++// to say so, or the operator reads `browser_recommended` and probes
++// authenticated routes with no session at all.
++func browserSessionUncaptured(cfg AutopilotPipelineConfig) bool {
++	if cfg.ContextBundle == nil {
++		return false
++	}
++	switch cfg.ContextBundle.BrowserDecision {
++	case "browser_required", "browser_recommended":
++	default:
++		return false
++	}
++	if p := cfg.PreparedAuth; p != nil && p.Source == "browser-auth" {
++		return false
++	}
++	return !browserSessionArtifactPopulated(cfg.Artifacts.BrowserSessionPath)
++}
++
++// browserSessionArtifactPopulated reports whether the browser-session artifact
++// holds a captured session. writePreparedAuthArtifacts seeds it with
++// status "pending"; any other non-empty status means somebody filled it in.
++func browserSessionArtifactPopulated(path string) bool {
++	if path == "" {
++		return false
++	}
++	data, err := os.ReadFile(path)
++	if err != nil {
++		return false
++	}
++	var state struct {
++		Status string `json:"status"`
++	}
++	if json.Unmarshal(data, &state) != nil {
++		return false
++	}
++	switch strings.TrimSpace(state.Status) {
++	case "", "pending":
++		return false
++	}
++	return true
++}
++
+ // formatFindings formats audit findings for inclusion in the agent prompt.
+ // Uses tiered formatting based on finding count to manage prompt size.
+ func formatFindings(findings []*audit.Finding) string {
+diff --git a/pkg/agent/session_repair.go b/pkg/agent/session_repair.go
+index c6149a1f..6305c2b2 100644
+--- a/pkg/agent/session_repair.go
++++ b/pkg/agent/session_repair.go
+@@ -14,13 +14,19 @@ import (
+ // RepairInvalidSessionConfig uses an LLM to fix garbled session config entries.
+ // It stays in the root package because it depends on *Engine.
+ func RepairInvalidSessionConfig(ctx context.Context, engine *Engine, original *AgentSessionConfig, targetURL string, cfg RepairConfig) *AgentSessionConfig {
+-	if engine == nil || original == nil || len(original.Sessions) == 0 {
++	if original == nil || len(original.Sessions) == 0 {
++		return nil
++	}
++	if engine == nil {
++		zap.L().Warn("Cannot repair invalid session config: no engine available",
++			zap.Int("entries", len(original.Sessions)))
+ 		return nil
+ 	}
+ 
+ 	// Marshal the garbled config for the prompt
+ 	garbledJSON, err := json.MarshalIndent(original, "", "  ")
+ 	if err != nil {
++		zap.L().Warn("Cannot marshal invalid session config for repair", zap.Error(err))
+ 		return nil
+ 	}
+ 
+@@ -45,14 +51,21 @@ func RepairInvalidSessionConfig(ctx context.Context, engine *Engine, original *A
+ 		ShowPrompt:   cfg.ShowPrompt,
+ 	})
+ 	if runErr != nil {
+-		zap.L().Warn("LLM session config repair failed", zap.Error(runErr))
++		zap.L().Warn("LLM session config repair failed",
++			zap.Error(runErr),
++			zap.Strings("validation_errors", errorLines))
+ 		return nil
+ 	}
+ 
+ 	// Extract JSON from the response
+ 	repaired := parseRepairedSessionConfig(result.RawOutput)
+ 	if repaired == nil {
+-		zap.L().Warn("Could not parse repaired session config from LLM output")
++		// Include a bounded snippet of the raw output: without it a parse
++		// failure is indistinguishable from an empty response, and the
++		// per-entry errors say what the prompt was asked to fix.
++		zap.L().Warn("Could not parse repaired session config from LLM output",
++			zap.String("raw_output", authsession.TruncateForLog(result.RawOutput, 200)),
++			zap.Strings("validation_errors", errorLines))
+ 		return nil
+ 	}
+ 
+@@ -62,7 +75,8 @@ func RepairInvalidSessionConfig(ctx context.Context, engine *Engine, original *A
+ 	}
+ 	repaired = authsession.ValidateSessionConfig(repaired)
+ 	if repaired == nil {
+-		zap.L().Warn("LLM-repaired session config still has invalid entries")
++		zap.L().Warn("LLM-repaired session config still has invalid entries",
++			zap.Strings("validation_errors", errorLines))
+ 		return nil
+ 	}
+ 
+diff --git a/pkg/agent/triage.go b/pkg/agent/triage.go
+index e38061e4..9a12eeda 100644
+--- a/pkg/agent/triage.go
++++ b/pkg/agent/triage.go
+@@ -456,18 +456,44 @@ func aggregateFollowUps(followUps []FollowUpScan) ScanRequest {
+ // Finding.Status. Confirmed findings move draft → triaged; false positives move
+ // draft → false_positive. Skips entries with empty finding_hash and logs any
+ // hashes the agent emitted but that didn't match a row. The write is scoped to
+-// the run's project (and agentic scan) so a hash shared with another project's
+-// finding never flips that finding.
++// the run's project so a hash shared with another project's finding never flips
++// that finding. The agentic scan scope spans the run uuid plus every child run
++// (parent_run_uuid = the run uuid): autopilot spawns a child audit run that owns
++// the findings it imports, so writing only the parent's uuid would leave every
++// audit finding stuck at draft.
+ func writeBackTriageVerdicts(ctx context.Context, repo *database.Repository, projectUUID, agenticScanUUID string, merged *TriageResult) {
+ 	if merged == nil {
+ 		return
+ 	}
++	// Resolve the child runs once per call. An empty agenticScanUUID (the
++	// pipeline path) leaves runUUIDs empty, which scopes the write by project
++	// alone — the pre-existing behaviour.
++	var runUUIDs []string
++	if agenticScanUUID != "" {
++		runUUIDs = append(runUUIDs, agenticScanUUID)
++		if children, err := repo.GetChildAgenticScans(ctx, agenticScanUUID); err != nil {
++			// Non-fatal: fall back to writing the parent run uuid only, exactly
++			// as this function behaved before child scoping existed.
++			zap.L().Debug("triage writeback: child run lookup failed; scoping to parent run only",
++				zap.String("agentic_scan_uuid", agenticScanUUID),
++				zap.Error(err))
++		} else {
++			for _, child := range children {
++				if child.UUID != "" {
++					runUUIDs = append(runUUIDs, child.UUID)
++				}
++			}
++		}
++	}
+ 	apply := func(items []TriagedFinding, status string) {
+ 		for _, t := range items {
+ 			if t.FindingHash == "" {
+ 				continue
+ 			}
+-			rows, err := repo.UpdateFindingStatusByHash(ctx, projectUUID, agenticScanUUID, t.FindingHash, status)
++			// includeUnattributed: the triage reads findings project-wide, and
++			// pre-scan/passive findings carry no run uuid — without it their
++			// verdicts matched nothing and the rows kept the scanner's status.
++			rows, err := repo.UpdateFindingStatusByHashForRuns(ctx, projectUUID, runUUIDs, true, t.FindingHash, status)
+ 			if err != nil {
+ 				zap.L().Warn("triage writeback failed",
+ 					zap.String("finding_hash", t.FindingHash),
+@@ -476,9 +502,15 @@ func writeBackTriageVerdicts(ctx context.Context, repo *database.Repository, pro
+ 				continue
+ 			}
+ 			if rows == 0 {
+-				zap.L().Debug("triage writeback: no matching finding",
++				// A verdict that matched nothing is the symptom this scoping
++				// fix exists for: the triage judged a finding it cannot write.
++				// Keep it a warning so it stays visible in run logs.
++				zap.L().Warn("triage writeback failed",
+ 					zap.String("finding_hash", t.FindingHash),
+-					zap.String("agentic_scan_uuid", agenticScanUUID))
++					zap.String("status", status),
++					zap.String("agentic_scan_uuid", agenticScanUUID),
++					zap.Int("run_uuids_tried", len(runUUIDs)),
++					zap.String("reason", "no matching finding across run scopes"))
+ 			}
+ 		}
+ 	}
+diff --git a/pkg/agent/triage_writeback_test.go b/pkg/agent/triage_writeback_test.go
+new file mode 100644
+index 00000000..bac02228
+--- /dev/null
++++ b/pkg/agent/triage_writeback_test.go
+@@ -0,0 +1,165 @@
++package agent
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"github.com/google/uuid"
++	"github.com/vigolium/vigolium/pkg/database"
++)
++
++// findingStatusByHash loads the lifecycle status of a single project-scoped
++// finding by its hash.
++func findingStatusByHash(t *testing.T, repo *database.Repository, projectUUID, hash string) string {
++	t.Helper()
++	var f database.Finding
++	if err := repo.DB().NewSelect().Model(&f).
++		Where("project_uuid = ?", projectUUID).
++		Where("finding_hash = ?", hash).
++		Scan(context.Background()); err != nil {
++		t.Fatalf("load finding %s: %v", hash, err)
++	}
++	return f.Status
++}
++
++func saveDraftFinding(t *testing.T, repo *database.Repository, projectUUID, agenticScanUUID, hash string) {
++	t.Helper()
++	if err := repo.SaveFindingDirect(context.Background(), &database.Finding{
++		FindingHash:     hash,
++		ProjectUUID:     projectUUID,
++		AgenticScanUUID: agenticScanUUID,
++		Status:          database.StatusDraft,
++		Severity:        database.SeverityHigh,
++	}); err != nil {
++		t.Fatalf("save finding %s: %v", hash, err)
++	}
++}
++
++func createRun(t *testing.T, repo *database.Repository, uuid, parent string) {
++	t.Helper()
++	if err := repo.CreateAgenticScan(context.Background(), &database.AgenticScan{
++		UUID:                  uuid,
++		ProjectUUID:           database.DefaultProjectUUID,
++		Mode:                  "autopilot",
++		AgentName:             "olium",
++		Status:                "completed",
++		ParentAgenticScanUUID: parent,
++		CompletedAt:           time.Now(),
++	}); err != nil {
++		t.Fatalf("create run %s: %v", uuid, err)
++	}
++}
++
++// TestWriteBackTriageVerdictsChildRuns locks the autopilot regression: the
++// parent run's post-scan triage writes back for the parent uuid, but the audit
++// the parent spawned owns its imported findings under the CHILD run uuid.
++// Scoping the write to the parent uuid alone leaves every audit finding at
++// draft, invisible to `vigolium finding --verdict confirmed,triaged` and never
++// reported. Before the fix this test's child-run assertion failed.
++func TestWriteBackTriageVerdictsChildRuns(t *testing.T) {
++	repo := newAuditTestRepo(t)
++	ctx := context.Background()
++
++	parent := uuid.NewString()
++	createRun(t, repo, parent, "")
++
++	child := uuid.NewString()
++	createRun(t, repo, child, parent)
++	otherChild := uuid.NewString()
++	createRun(t, repo, otherChild, parent)
++	// A run that is not a child of the parent must not be touched.
++	unrelated := uuid.NewString()
++	createRun(t, repo, unrelated, "")
++
++	childHash := uuid.NewString()
++	otherChildHash := uuid.NewString()
++	unrelatedHash := uuid.NewString()
++	saveDraftFinding(t, repo, database.DefaultProjectUUID, child, childHash)
++	saveDraftFinding(t, repo, database.DefaultProjectUUID, otherChild, otherChildHash)
++	saveDraftFinding(t, repo, database.DefaultProjectUUID, unrelated, unrelatedHash)
++
++	writeBackTriageVerdicts(ctx, repo, database.DefaultProjectUUID, parent, &TriageResult{
++		Confirmed: []TriagedFinding{{FindingHash: childHash}, {FindingHash: otherChildHash}},
++	})
++
++	if got := findingStatusByHash(t, repo, database.DefaultProjectUUID, childHash); got != database.StatusTriaged {
++		t.Errorf("child-run finding status = %q, want %q — parent triage must reach child-owned findings", got, database.StatusTriaged)
++	}
++	if got := findingStatusByHash(t, repo, database.DefaultProjectUUID, otherChildHash); got != database.StatusTriaged {
++		t.Errorf("second child-run finding status = %q, want %q", got, database.StatusTriaged)
++	}
++	if got := findingStatusByHash(t, repo, database.DefaultProjectUUID, unrelatedHash); got != database.StatusDraft {
++		t.Errorf("unrelated run finding status = %q, want %q — must not be flipped", got, database.StatusDraft)
++	}
++}
++
++// TestWriteBackTriageVerdictsUnattributedRows covers the other half of the same
++// read/write asymmetry: the triage reads findings project-wide, but pre-scan and
++// passive findings are stored with no agentic_scan_uuid at all, so a run-scoped
++// write never matched them and their verdicts were dropped (observed live: rows
++// the triage called false positives kept the scanner's `triaged` and stayed in
++// reports). A row owned by another run must still be left alone.
++func TestWriteBackTriageVerdictsUnattributedRows(t *testing.T) {
++	repo := newAuditTestRepo(t)
++	ctx := context.Background()
++
++	run := uuid.NewString()
++	other := uuid.NewString()
++	createRun(t, repo, run, "")
++	createRun(t, repo, other, "")
++
++	unattributedHash := uuid.NewString()
++	otherHash := uuid.NewString()
++	saveDraftFinding(t, repo, database.DefaultProjectUUID, "", unattributedHash)
++	saveDraftFinding(t, repo, database.DefaultProjectUUID, other, otherHash)
++
++	writeBackTriageVerdicts(ctx, repo, database.DefaultProjectUUID, run, &TriageResult{
++		FalsePositives: []TriagedFinding{{FindingHash: unattributedHash}, {FindingHash: otherHash}},
++	})
++
++	if got := findingStatusByHash(t, repo, database.DefaultProjectUUID, unattributedHash); got != database.StatusFalsePositive {
++		t.Errorf("unattributed finding status = %q, want %q — a verdict on a row with no run uuid must land", got, database.StatusFalsePositive)
++	}
++	if got := findingStatusByHash(t, repo, database.DefaultProjectUUID, otherHash); got != database.StatusDraft {
++		t.Errorf("other run's finding status = %q, want %q — must not be flipped", got, database.StatusDraft)
++	}
++}
++
++// TestWriteBackTriageVerdictsNoChildrenFallback covers the fallback path: a run
++// with no child audit runs writes back exactly as before, by its own uuid, and
++// an empty agenticScanUUID keeps project-only scoping.
++func TestWriteBackTriageVerdictsNoChildrenFallback(t *testing.T) {
++	repo := newAuditTestRepo(t)
++	ctx := context.Background()
++
++	run := uuid.NewString()
++	other := uuid.NewString()
++	runHash := uuid.NewString()
++	otherHash := uuid.NewString()
++	unscopedHash := uuid.NewString()
++	saveDraftFinding(t, repo, database.DefaultProjectUUID, run, runHash)
++	saveDraftFinding(t, repo, database.DefaultProjectUUID, other, otherHash)
++	saveDraftFinding(t, repo, database.DefaultProjectUUID, other, unscopedHash)
++
++	// No children exist for `run`: its own finding still flips, and another
++	// run's finding with a different hash is untouched.
++	writeBackTriageVerdicts(ctx, repo, database.DefaultProjectUUID, run, &TriageResult{
++		Confirmed: []TriagedFinding{{FindingHash: runHash}},
++	})
++	if got := findingStatusByHash(t, repo, database.DefaultProjectUUID, runHash); got != database.StatusTriaged {
++		t.Errorf("run finding status = %q, want %q", got, database.StatusTriaged)
++	}
++	if got := findingStatusByHash(t, repo, database.DefaultProjectUUID, otherHash); got != database.StatusDraft {
++		t.Errorf("other finding status = %q, want %q", got, database.StatusDraft)
++	}
++
++	// Empty run uuid (the pipeline path) scopes by project alone, so the hash
++	// flips regardless of which run owns the row.
++	writeBackTriageVerdicts(ctx, repo, database.DefaultProjectUUID, "", &TriageResult{
++		Confirmed: []TriagedFinding{{FindingHash: unscopedHash}},
++	})
++	if got := findingStatusByHash(t, repo, database.DefaultProjectUUID, unscopedHash); got != database.StatusTriaged {
++		t.Errorf("project-scoped write status = %q, want %q", got, database.StatusTriaged)
++	}
++}
+diff --git a/pkg/cli/agent.go b/pkg/cli/agent.go
+index c9de6c3b..36afe7dd 100644
+--- a/pkg/cli/agent.go
++++ b/pkg/cli/agent.go
+@@ -288,7 +288,10 @@ func runAgentQuery(cmd *cobra.Command, args []string) error {
+ 	// The query's own agentic_scans row, so `agent session`, `log ls` and
+ 	// `finding --agentic-scan` find it like any other agent run. A dry run
+ 	// renders a prompt only and records nothing.
+-	projectUUID, _ := resolveProjectUUID()
++	projectUUID, projectErr := resolveProjectUUID()
++	if projectErr != nil {
++		return fmt.Errorf("cannot scope this run to a project: %w", projectErr)
++	}
+ 	startedAt := time.Now()
+ 	if !agentDryRun {
+ 		_, model := settings.Agent.BackendMeta()
+diff --git a/pkg/cli/agent_autopilot.go b/pkg/cli/agent_autopilot.go
+index 46bdda77..20b2ae20 100644
+--- a/pkg/cli/agent_autopilot.go
++++ b/pkg/cli/agent_autopilot.go
+@@ -422,7 +422,10 @@ func runAgentAutopilot(cmd *cobra.Command, args []string) (err error) {
+ 		if verr != nil {
+ 			return usageErrorf("--burp-bridge-url: %w", verr)
+ 		}
+-		projectUUID, _ := resolveProjectUUID()
++		projectUUID, projectErr := resolveProjectUUID()
++		if projectErr != nil {
++			return fmt.Errorf("--burp-bridge-url: cannot resolve project: %w", projectErr)
++		}
+ 		fmt.Fprintf(os.Stderr, "%s Importing live bridge traffic from %s ...\n",
+ 			terminal.InfoSymbol(), terminal.Cyan(validated))
+ 		res, ierr := importBurpTrafficToDB(context.Background(), repo, validated,
+@@ -511,7 +514,10 @@ func runAgentAutopilot(cmd *cobra.Command, args []string) (err error) {
+ 		// Pass the active project so --project-uuid (or --project-name) can
+ 		// override the project component parsed from the gs:// URI, matching
+ 		// audit/swarm/scan behavior.
+-		projectUUID, _ := resolveProjectUUID()
++		projectUUID, projectErr := resolveProjectUUID()
++		if projectErr != nil {
++			return fmt.Errorf("failed to resolve project for gs:// source: %w", projectErr)
++		}
+ 		extractedPath, cleanup, gcsErr := storage.ResolveGCSSource(&settings.Storage, autopilotSource, projectUUID)
+ 		if gcsErr != nil {
+ 			return fmt.Errorf("failed to resolve gs:// source: %w", gcsErr)
+diff --git a/pkg/cli/agent_autopilot_olium.go b/pkg/cli/agent_autopilot_olium.go
+index 6ae9529c..d51cf02f 100644
+--- a/pkg/cli/agent_autopilot_olium.go
++++ b/pkg/cli/agent_autopilot_olium.go
+@@ -112,7 +112,14 @@ func runAutopilotOlium(parentCtx context.Context, settings *config.Settings, rep
+ 		agent.CopySkillsToSessionDir(sessionDir)
+ 	}
+ 
+-	projectUUID, _ := resolveProjectUUID()
++	projectUUID, projectErr := resolveProjectUUID()
++	if projectErr != nil {
++		// A --project-name that names no project used to be swallowed here:
++		// the run then wrote its findings to the Default Project and the
++		// post-run triage failed for want of a project UUID, with nothing in
++		// the log saying why. Fail before spending the run instead.
++		return fmt.Errorf("cannot scope this run to a project: %w", projectErr)
++	}
+ 	outcome.ProjectUUID = projectUUID
+ 	if err := prepareAutopilotAuthFiles(ctx, settings, repo, projectUUID, autopilotTarget, autopilotAuthFiles, !autopilotDryRun); err != nil {
+ 		return err
+@@ -718,6 +725,9 @@ func runAutopilotOliumPipeline(
+ 		MaxCommands:           autopilotMaxCommands,
+ 		TokenBudget:           autopilotTokenBudget,
+ 		MaxCostUSD:            autopilotMaxCostUSD,
++		SectionMaxTurns:       settings.Agent.Olium.SectionMaxTurns,
++		StallTurns:            settings.Agent.Olium.StallTurns,
++		StallRotations:        settings.Agent.Olium.StallRotations,
+ 		SkipPreflight:         autopilotPreflight.skip,
+ 		DryRun:                autopilotDryRun,
+ 		ShowPrompt:            autopilotShowPrompt,
+diff --git a/pkg/database/findings_coverage_test.go b/pkg/database/findings_coverage_test.go
+index 5cd93e41..62ae0f0e 100644
+--- a/pkg/database/findings_coverage_test.go
++++ b/pkg/database/findings_coverage_test.go
+@@ -187,6 +187,92 @@ func TestUpdateFindingStatusByHash(t *testing.T) {
+ 	}
+ }
+ 
++// TestUpdateFindingStatusByHashForRuns covers the multi-run sibling of
++// UpdateFindingStatusByHash used by the autopilot triage writeback: one hash
++// must flip the rows owned by every attempted run uuid and nothing else, while
++// an empty run slice degrades to project-only scoping (the old behaviour).
++// includeUnattributed additionally reaches rows with no run uuid — pre-scan and
++// passive findings are stored that way, and the triage reads project-wide, so
++// without it those verdicts matched nothing (observed live).
++func TestUpdateFindingStatusByHashForRuns(t *testing.T) {
++	db := newTestDB(t)
++	repo := NewRepository(db)
++	ctx := context.Background()
++
++	// The unique index is (project_uuid, finding_hash), so rows sharing one hash
++	// must sit in distinct projects — that is exactly how the same hash can be
++	// scoped to several runs without the insert dedup collapsing them.
++	hash := uuid.NewString()
++	parent, child, other := uuid.NewString(), uuid.NewString(), uuid.NewString()
++	idParent := saveFindingFull(t, repo, &Finding{ProjectUUID: uuid.NewString(), FindingHash: hash, AgenticScanUUID: parent, Status: StatusDraft})
++	idChild := saveFindingFull(t, repo, &Finding{ProjectUUID: uuid.NewString(), FindingHash: hash, AgenticScanUUID: child, Status: StatusDraft})
++	idOther := saveFindingFull(t, repo, &Finding{ProjectUUID: uuid.NewString(), FindingHash: hash, AgenticScanUUID: other, Status: StatusDraft})
++	idUnattributed := saveFindingFull(t, repo, &Finding{ProjectUUID: uuid.NewString(), FindingHash: hash, Status: StatusDraft})
++
++	statusOf := func(id int64) string {
++		t.Helper()
++		got, err := repo.GetFindingByID(ctx, id)
++		if err != nil {
++			t.Fatalf("GetFindingByID(%d): %v", id, err)
++		}
++		return got.Status
++	}
++
++	// Parent + child uuids: exactly those two rows flip; the unrelated run's
++	// copy and the unattributed row stay draft.
++	n, err := repo.UpdateFindingStatusByHashForRuns(ctx, "", []string{parent, child}, false, hash, StatusTriaged)
++	if err != nil {
++		t.Fatalf("UpdateFindingStatusByHashForRuns: %v", err)
++	}
++	if n != 2 {
++		t.Errorf("rows updated = %d, want 2", n)
++	}
++	for id, want := range map[int64]string{
++		idParent: StatusTriaged, idChild: StatusTriaged,
++		idOther: StatusDraft, idUnattributed: StatusDraft,
++	} {
++		if got := statusOf(id); got != want {
++			t.Errorf("finding %d status = %q, want %q", id, got, want)
++		}
++	}
++
++	// includeUnattributed reaches the run's own row plus the one with no run
++	// uuid, and still leaves the unrelated run's copy alone.
++	n, err = repo.UpdateFindingStatusByHashForRuns(ctx, "", []string{parent}, true, hash, StatusFalsePositive)
++	if err != nil {
++		t.Fatalf("UpdateFindingStatusByHashForRuns(includeUnattributed): %v", err)
++	}
++	if n != 2 {
++		t.Errorf("rows updated with includeUnattributed = %d, want 2", n)
++	}
++	for id, want := range map[int64]string{
++		idParent: StatusFalsePositive, idUnattributed: StatusFalsePositive,
++		idOther: StatusDraft, idChild: StatusTriaged,
++	} {
++		if got := statusOf(id); got != want {
++			t.Errorf("finding %d status = %q, want %q", id, got, want)
++		}
++	}
++
++	// Empty run slice → project scope only, matching UpdateFindingStatusByHash
++	// called with agenticScanUUID "".
++	n, err = repo.UpdateFindingStatusByHashForRuns(ctx, "", nil, false, hash, StatusFixed)
++	if err != nil {
++		t.Fatalf("UpdateFindingStatusByHashForRuns(empty runs): %v", err)
++	}
++	if n != 4 {
++		t.Errorf("rows updated with empty runs = %d, want 4", n)
++	}
++
++	// Invalid args mirror UpdateFindingStatusByHash.
++	if _, err := repo.UpdateFindingStatusByHashForRuns(ctx, "", []string{parent}, false, hash, "bogus"); err == nil {
++		t.Error("invalid status should error")
++	}
++	if _, err := repo.UpdateFindingStatusByHashForRuns(ctx, "", []string{parent}, false, "", StatusFixed); err == nil {
++		t.Error("empty hash should error")
++	}
++}
++
+ // TestFindingStatusWritesAreProjectScoped locks the project-isolation fix: a
+ // writer scoped to project A cannot flip project B's finding by raw id or by a
+ // finding_hash both projects share.
+diff --git a/pkg/database/repository_findings.go b/pkg/database/repository_findings.go
+index c8a25731..6738e9c3 100644
+--- a/pkg/database/repository_findings.go
++++ b/pkg/database/repository_findings.go
+@@ -535,6 +535,55 @@ func (r *Repository) UpdateFindingStatusByHash(ctx context.Context, projectUUID,
+ 	return rows, nil
+ }
+ 
++// UpdateFindingStatusByHashForRuns is UpdateFindingStatusByHash across a set of
++// agentic_scan_uuid scopes instead of a single one. Autopilot spawns a child audit
++// run (parent_run_uuid = the autopilot run uuid) that owns the findings it imports,
++// so the parent's post-scan triage must write across the parent uuid plus every
++// child uuid. An empty run list scopes only by project (when projectUUID is
++// non-empty), exactly like UpdateFindingStatusByHash called with agenticScanUUID "".
++//
++// includeUnattributed additionally matches rows with no run attribution at all
++// (agentic_scan_uuid NULL or empty) whenever run uuids are given. Pre-scan and
++// passive findings are stored that way, and the triage reads findings
++// project-wide — so without this the verdicts it reaches on those rows match
++// nothing and are silently dropped while the rows keep their scanner-assigned
++// status. Rows owned by a *different* run still never match, so the run scoping
++// that keeps one run's triage out of another's findings is preserved. With an
++// empty run list the scope stays project-level (see below) and this flag is
++// irrelevant.
++//
++// Returns the number of rows updated.
++func (r *Repository) UpdateFindingStatusByHashForRuns(ctx context.Context, projectUUID string, agenticScanUUIDs []string, includeUnattributed bool, findingHash, status string) (int64, error) {
++	if !IsValidFindingStatus(status) {
++		return 0, fmt.Errorf("UpdateFindingStatusByHashForRuns: invalid status %q", status)
++	}
++	if findingHash == "" {
++		return 0, fmt.Errorf("UpdateFindingStatusByHashForRuns: empty finding_hash")
++	}
++	q := r.db.NewUpdate().
++		Model((*Finding)(nil)).
++		Set("status = ?", status).
++		Where("finding_hash = ?", findingHash)
++	if projectUUID != "" {
++		q = q.Where("project_uuid = ?", projectUUID)
++	}
++	switch {
++	case len(agenticScanUUIDs) > 0 && includeUnattributed:
++		q = q.Where("(agentic_scan_uuid IN (?) OR agentic_scan_uuid IS NULL OR agentic_scan_uuid = '')", bun.List(agenticScanUUIDs))
++	case len(agenticScanUUIDs) > 0:
++		q = q.Where("agentic_scan_uuid IN (?)", bun.List(agenticScanUUIDs))
++	}
++	// An empty run list leaves the scope at project level (no uuid filter) —
++	// includeUnattributed does not narrow it, because a caller with no run uuid
++	// to scope by has nothing to exclude in the first place.
++	res, err := q.Exec(ctx)
++	if err != nil {
++		return 0, fmt.Errorf("UpdateFindingStatusByHashForRuns: %w", err)
++	}
++	rows, _ := res.RowsAffected()
++	return rows, nil
++}
++
+ // IsValidFindingSeverity reports whether s is a recognised Finding severity level.
+ func IsValidFindingSeverity(s string) bool {
+ 	switch s {
+diff --git a/pkg/olium/autopilot/autopilot.go b/pkg/olium/autopilot/autopilot.go
+index 500e3ae8..24143aa4 100644
+--- a/pkg/olium/autopilot/autopilot.go
++++ b/pkg/olium/autopilot/autopilot.go
+@@ -283,6 +283,36 @@ type Options struct {
+ 	// 0 falls back to defaultPostHaltGapThreshold (5).
+ 	PostHaltGapThreshold int
+ 
++	// NoFinalReportTurn disables the report-only re-entry. By default a run
++	// that is stopped rather than finished — the stall guard tripping, or the
++	// engine ending on its own — and that has reported nothing re-enters ONCE
++	// with a reset context and a report-only mission: recover the evidence
++	// from the session transcript, call report_finding for everything
++	// verified, then write the findings.json / dismissed.json artifacts.
++	//
++	// It exists because the stall detector's notion of progress only counts
++	// target-touching or result-recording tools (see productiveTools): an
++	// operator that verifies a bug through bash — reading source, querying the
++	// target's database, replaying a request by hand — looks stalled, and the
++	// run used to end with its verified evidence stranded in the transcript
++	// and nothing reported. The turn is bounded by the run's own turn cap and
++	// only fires when no cap was spent, so it cannot extend a budget stop.
++	NoFinalReportTurn bool
++
++	// MaxTurnsPerSection, StallTurns and MaxStallRotations tune the durable
++	// section controller (shadow/enforced modes; ignored in legacy). Zero
++	// values fall back to the package defaults — 40 turns per section, 12
++	// consecutive unproductive turns before a rotation, 3 stall rotations
++	// before the run is stopped.
++	//
++	// They exist because the stall detector's notion of progress is narrow (see
++	// productiveTools): an operator that verifies through bash does real work
++	// the detector cannot see, so a codebase that rewards manual probing may
++	// want a longer leash rather than the default three strikes.
++	MaxTurnsPerSection int
++	StallTurns         int
++	MaxStallRotations  int
++
+ 	// CoverageProbe is the probe used to verify coverage after halt. The
+ 	// pipeline runner builds one from the autopilot's Repo + ProjectUUID +
+ 	// Target; direct CLI callers can leave it nil to disable post-halt
+@@ -927,6 +957,44 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
+ 	stalled := false
+ 	nextPrompt := initial
+ 
++	// --- Final report turn (see Options.NoFinalReportTurn) ---
++	// A run that is stopped rather than finished — the stall guard tripping, or
++	// the engine giving up on its own — used to end with whatever the operator
++	// had already reported. For a bash-heavy investigation that is nothing even
++	// when real issues were verified, because the stall detector only counts
++	// target-touching / result-recording tools as progress. Grant exactly one
++	// report-only turn (fresh context, evidence recovered from the transcript)
++	// before accepting the stop.
++	finalReportTried := false
++	finalReportDue := func(src HaltSource) bool {
++		if opts.NoFinalReportTurn || finalReportTried || reportCtx.Count.Load() > 0 {
++			return false
++		}
++		// Only stalls and silent engine stops qualify. A budget halt means the
++		// cap behind it is already spent, and extra turns would violate it.
++		return src == HaltSourceStall || src == HaltSourceUnset
++	}
++	reenterForFinalReport := func(reason string, ctrl *SectionController) {
++		finalReportTried = true
++		if reason == "" {
++			reason = "engine stopped without a halt signal"
++		}
++		if firstHaltReason == "" {
++			firstHaltReason = reason
++		}
++		_, _ = fmt.Fprintf(opts.ToolLog, "[autopilot] run stopped (%s) with 0 findings reported — re-entering once for a report-only turn\n", reason)
++		// The rescue turn is mandated and bounded, and recovering evidence from
++		// the transcript looks unproductive to the stall detector — without
++		// this the guard killed the turn after a single read (observed live), so
++		// the run ended having reported nothing anyway.
++		if ctrl != nil {
++			ctrl.SuppressStallGuard()
++		}
++		halt.Reset()
++		eng.Reset()
++		nextPrompt = buildFinalReportPrompt(opts)
++	}
++
+ 	// --- Durable-autopilot section-rotation state (non-legacy modes only) ---
+ 	// Every variable here is inert in legacy: rotationEnabled is false, so
+ 	// runIteration never touches them and the outer loop's handoff branch is
+@@ -944,7 +1012,10 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
+ 	var rotationReason string
+ 	if rotationEnabled {
+ 		controller = NewSectionController(opts.SessionDir, opts.Repo, opts.ProjectUUID, opts.AgenticScanUUID,
+-			scratch, sectionRec, DefaultMaxTurnsPerSection, DefaultStallTurns, 0)
++			scratch, sectionRec, opts.MaxTurnsPerSection, opts.StallTurns, 0)
++		if opts.MaxStallRotations > 0 {
++			controller.MaxStallRotations = opts.MaxStallRotations
++		}
+ 		missionBrief = buildRotationMission(opts)
+ 		firstTask := scratch.NextOpenTask()
+ 		if firstTask == "" {
+@@ -1098,17 +1169,25 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
+ 				// halt/budget already cancelled this turn.
+ 				if rotationEnabled && controller != nil && !pendingRotation && iterCtx.Err() == nil {
+ 					if rotate, reason := controller.ShouldRotate(sectionTurns, sectionIn+sectionOut, progressedThisWindow); rotate {
+-						// A stall that survives repeated fresh starts is
+-						// terminal. Rotation resets the stall counter and
+-						// re-enters, so without this a model stuck on a
+-						// broken tool contract rotates until the wall clock
+-						// ends the run - with nothing to show for the hours.
+-						if controller.StalledOut() {
++						switch {
++						case finalReportTried:
++							// The report-only turn is the run's last act: a
++							// section limit must end the run, not rotate into a
++							// fresh mission that drops the report instruction.
++							reportDone := fmt.Sprintf("report-only turn reached its section limit (%s)", reason)
++							halt.SetByReport(reportDone)
++							_, _ = fmt.Fprintf(opts.ToolLog, "[autopilot] %s — ending the run\n", reportDone)
++						case controller.StalledOut():
++							// A stall that survives repeated fresh starts is
++							// terminal. Rotation resets the stall counter and
++							// re-enters, so without this a model stuck on a
++							// broken tool contract rotates until the wall clock
++							// ends the run - with nothing to show for the hours.
+ 							haltReason := fmt.Sprintf("no productive tool call across %d consecutive sections (%s) - halting rather than rotating again",
+ 								controller.MaxStallRotations, reason)
+-							halt.SetByBudget(haltReason)
++							halt.SetByStall(haltReason)
+ 							_, _ = fmt.Fprintf(opts.ToolLog, "[autopilot] %s\n", haltReason)
+-						} else {
++						default:
+ 							pendingRotation = true
+ 							rotationReason = reason
+ 							_, _ = fmt.Fprintf(opts.ToolLog, "[autopilot] section %d rotating (%s, turns=%d) — rebuilding context\n",
+@@ -1248,11 +1327,23 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
+ 			// Engine stopped on its own (e.g. NudgeOnEmptyToolCalls exhausted)
+ 			// without a halt signal. Treat as natural completion; no
+ 			// verification re-entry because there's no model-driven halt to
+-			// double-check.
++			// double-check — but a silent stop that reported nothing still gets
++			// the one report-only turn.
++			if finalReportDue(HaltSourceUnset) {
++				reenterForFinalReport(reason, controller)
++				continue
++			}
+ 			break
+ 		}
+ 		haltSrc := halt.Source()
+ 		if !verifyEnabled || haltSrc != HaltSourceModel || reentries >= maxPostHaltReentries {
++			// A stopped run is not necessarily a finished one: when the stall
++			// guard tripped (or the engine gave up) with nothing reported, give
++			// the operator one report-only turn before accepting the stop.
++			if finalReportDue(haltSrc) {
++				reenterForFinalReport(reason, controller)
++				continue
++			}
+ 			break
+ 		}
+ 
+@@ -1355,6 +1446,54 @@ func (r *Result) Diagnosis() string {
+ 	return ""
+ }
+ 
++// buildFinalReportPrompt is the user-role mission for the one report-only turn
++// granted to a run that is being stopped with nothing reported (see
++// Options.NoFinalReportTurn). The engine context is reset before this prompt,
++// so it tells the operator where the durable evidence lives instead of
++// assuming recall: the run's own transcript, the scratchpad, and the spilled
++// tool results. Kept in-package for the same reason as
++// formatCoverageGapPrompt — pkg/agent imports us.
++func buildFinalReportPrompt(opts Options) string {
++	var b strings.Builder
++	b.WriteString("# Final turn: report what you verified, then stop\n\n")
++	b.WriteString("This run is being stopped and not a single finding has been reported. Your conversation context has been reset, so recover the facts from the durable record of this run rather than from memory:\n\n")
++	if opts.SessionDir != "" {
++		fmt.Fprintf(&b, "- Full transcript of this run (every tool call and result, including spilled output): `%s`\n",
++			filepath.Join(opts.SessionDir, "transcript.jsonl"))
++		fmt.Fprintf(&b, "- Oversized tool results spilled earlier: `%s`\n",
++			filepath.Join(opts.SessionDir, "tool-results"))
++		fmt.Fprintf(&b, "- Working notes and candidates: `%s`\n",
++			filepath.Join(opts.SessionDir, "autopilot", "scratchpad.json"))
++	}
++	if opts.Target != "" {
++		fmt.Fprintf(&b, "- Target: %s\n", opts.Target)
++	}
++	if opts.SourcePath != "" {
++		fmt.Fprintf(&b, "- Source: %s\n", opts.SourcePath)
++	}
++	b.WriteString("\nThe transcript is large — search it (grep) for the probes, requests, and file reads that produced evidence.\n\n")
++	b.WriteString("Do this, in order:\n\n")
++	b.WriteString("1. Recover what you verified, from that transcript.\n")
++	// Enforced mode replaces report_finding with propose_candidate (a fresh
++	// verifier promotes the confirmed candidates into findings), so the
++	// report-only turn has to name the tool that mode actually registers.
++	findingTool, findingVerb := "report_finding", "report"
++	if config.NormalizeAutopilotMode(opts.Mode) == config.AutopilotModeEnforced {
++		findingTool, findingVerb = "propose_candidate", "propose"
++	}
++	fmt.Fprintf(&b, "2. Call `%s` once per issue you actually verified — title, severity, confidence, description, remediation, and the evidence you observed (request/response, `file:line`, database output). %s only what your own tool results show: inventing findings is worse than reporting none.\n",
++		findingTool, strings.ToUpper(findingVerb[:1])+findingVerb[1:])
++	if opts.SessionDir != "" {
++		fmt.Fprintf(&b, "3. Write both artifacts with `write_file`: `%s` — a JSON array holding one object per finding you just reported — and `%s` — a JSON array of what you checked and ruled out, one line of reason each. Write `[]` when a list is empty.\n",
++			filepath.Join(opts.SessionDir, "autopilot", "findings.json"),
++			filepath.Join(opts.SessionDir, "autopilot", "dismissed.json"))
++	} else {
++		b.WriteString("3. Write the findings and dismissed artifacts with `write_file`, at the paths given in your brief.\n")
++	}
++	b.WriteString("\nDo not start new investigations, do not run new scans, and do not call halt_scan. Reporting is the entire task: a handful of tool calls, then stop.\n")
++	return b.String()
++}
++
+ // formatCoverageGapPrompt builds the user-role message the engine sees on a
+ // post-halt re-entry. Kept in-package so we don't depend on pkg/agent (which
+ // imports us). The pkg/agent FormatGapForPrompt helper has the same shape
+diff --git a/pkg/olium/autopilot/final_report_test.go b/pkg/olium/autopilot/final_report_test.go
+new file mode 100644
+index 00000000..d95c6d73
+--- /dev/null
++++ b/pkg/olium/autopilot/final_report_test.go
+@@ -0,0 +1,211 @@
++package autopilot
++
++import (
++	"bytes"
++	"context"
++	"io"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/vigolium/vigolium/pkg/olium/provider"
++	"github.com/vigolium/vigolium/pkg/olium/stream"
++)
++
++// promptRecorder captures the user prompt behind every provider request so a
++// test can assert which mission the loop sent.
++type promptRecorder struct {
++	mu      sync.Mutex
++	prompts []string
++}
++
++func (r *promptRecorder) record(req provider.Request) {
++	if n := len(req.Messages); n > 0 {
++		m := req.Messages[n-1]
++		r.mu.Lock()
++		r.prompts = append(r.prompts, m.Text+m.Content)
++		r.mu.Unlock()
++	}
++}
++
++func (r *promptRecorder) sawPrompt(substr string) bool {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	for _, s := range r.prompts {
++		if strings.Contains(s, substr) {
++			return true
++		}
++	}
++	return false
++}
++
++func (r *promptRecorder) promptCount() int {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	return len(r.prompts)
++}
++
++// silentProvider answers with text and no tool call, which is the state the
++// engine gives up on by itself — no halt signal. That is what the report-only
++// turn exists to rescue: an operator that verified issues without ever calling
++// a tool the stall detector counts as progress would otherwise end the run with
++// nothing reported.
++type silentProvider struct{ promptRecorder }
++
++func (*silentProvider) Name() string { return "silent" }
++
++func (p *silentProvider) Stream(ctx context.Context, req provider.Request) (<-chan stream.Event, error) {
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
++	p.record(req)
++	ch := make(chan stream.Event, 4)
++	go func() {
++		defer close(ch)
++		ch <- stream.Event{Type: stream.EventTextDelta, Delta: "nothing further to check"}
++		ch <- stream.Event{Type: stream.EventDone, StopReason: stream.StopReasonStop}
++	}()
++	return ch, nil
++}
++
++// loopingProvider always calls the read-only `ls` tool: a tool that touches
++// nothing on the target and records no result, so every turn counts as
++// unproductive for the stall detector — the shape of a bash-style investigation.
++type loopingProvider struct{ promptRecorder }
++
++func (*loopingProvider) Name() string { return "loop" }
++
++func (p *loopingProvider) Stream(ctx context.Context, req provider.Request) (<-chan stream.Event, error) {
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
++	p.record(req)
++	ch := make(chan stream.Event, 4)
++	go func() {
++		defer close(ch)
++		ch <- stream.Event{Type: stream.EventToolCallStart, ToolCall: &stream.ToolCall{ID: "c", Name: "ls"}}
++		ch <- stream.Event{Type: stream.EventToolCallEnd, ToolCall: &stream.ToolCall{ID: "c", Name: "ls", Arguments: map[string]any{"path": "."}}}
++		ch <- stream.Event{Type: stream.EventDone, StopReason: stream.StopReasonToolUse}
++	}()
++	return ch, nil
++}
++
++// runSilent runs a scan whose model never calls a tool and never halts, so the
++// engine ends the iteration on its own.
++func runSilent(t *testing.T, opts Options) *silentProvider {
++	t.Helper()
++	t.Setenv("HOME", t.TempDir()) // never read the operator's ~/.vigolium
++	prov := &silentProvider{}
++	opts.Provider = prov
++	opts.Model = "claude-sonnet-4"
++	opts.Out = io.Discard
++	opts.ToolLog = io.Discard
++	opts.NoSkillFilter = true
++	opts.SourcePath = t.TempDir()
++	if opts.SessionDir == "" {
++		opts.SessionDir = t.TempDir()
++	}
++	if opts.MaxTurns == 0 {
++		opts.MaxTurns = 5
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++	defer cancel()
++	res, err := Run(ctx, opts)
++	if err != nil {
++		t.Fatalf("Run: %v", err)
++	}
++	if res.FindingCount != 0 {
++		t.Fatalf("FindingCount = %d, want 0: this provider never reports", res.FindingCount)
++	}
++	return prov
++}
++
++// TestRunGrantsReportOnlyTurnOnSilentStop: a run that stops with nothing
++// reported re-enters once with the report-only mission. Before the report-only
++// turn existed this test saw no such prompt, and the verified work stayed in
++// the transcript forever.
++func TestRunGrantsReportOnlyTurnOnSilentStop(t *testing.T) {
++	prov := runSilent(t, Options{})
++	if !prov.sawPrompt("Final turn: report what you verified") {
++		t.Fatalf("report-only turn was not granted (%d prompts seen)", prov.promptCount())
++	}
++	// The context is reset for that turn, so the prompt has to say where the
++	// evidence and the artifacts live.
++	if !prov.sawPrompt("transcript.jsonl") {
++		t.Errorf("report prompt does not point at the run transcript")
++	}
++	if !prov.sawPrompt("autopilot/findings.json") {
++		t.Errorf("report prompt does not name the findings artifact")
++	}
++}
++
++// TestRunNoFinalReportTurnOptOut: the re-entry is opt-out, so callers that want
++// the old stop-with-nothing behaviour still get it.
++func TestRunNoFinalReportTurnOptOut(t *testing.T) {
++	prov := runSilent(t, Options{NoFinalReportTurn: true})
++	if prov.sawPrompt("Final turn: report what you verified") {
++		t.Fatalf("report-only turn ran despite NoFinalReportTurn")
++	}
++}
++
++// TestBuildFinalReportPromptModeAware: enforced mode never registers
++// report_finding (the operator proposes candidates and a verifier promotes
++// them), so the report-only mission must name the tool that mode has.
++func TestBuildFinalReportPromptModeAware(t *testing.T) {
++	shadow := buildFinalReportPrompt(Options{Mode: "shadow", SessionDir: "/tmp/s"})
++	if !strings.Contains(shadow, "`report_finding`") {
++		t.Errorf("shadow mode prompt should name report_finding:\n%s", shadow)
++	}
++	enforced := buildFinalReportPrompt(Options{Mode: "enforced", SessionDir: "/tmp/s"})
++	if !strings.Contains(enforced, "`propose_candidate`") {
++		t.Errorf("enforced mode prompt should name propose_candidate:\n%s", enforced)
++	}
++	if strings.Contains(enforced, "`report_finding`") {
++		t.Errorf("enforced mode prompt names report_finding, which that mode does not register:\n%s", enforced)
++	}
++}
++
++// TestRunHonoursConfiguredStallLimits: the stall/section budgets reach the
++// section controller instead of being pinned to the package constants, and a
++// stall-stopped run still gets its report-only turn. With the defaults (12
++// stalled turns, 3 rotations) this provider would need ~36 turns to reach the
++// same stop, so the tool-call ceiling is what proves the knobs took effect.
++func TestRunHonoursConfiguredStallLimits(t *testing.T) {
++	t.Setenv("HOME", t.TempDir())
++	prov := &loopingProvider{}
++	var toolLog bytes.Buffer
++	opts := Options{
++		Provider:           prov,
++		Model:              "claude-sonnet-4",
++		Out:                io.Discard,
++		ToolLog:            &toolLog,
++		NoSkillFilter:      true,
++		SourcePath:         t.TempDir(),
++		SessionDir:         t.TempDir(),
++		Mode:               "shadow",
++		MaxTurns:           60,
++		MaxTurnsPerSection: 10,
++		StallTurns:         2,
++		MaxStallRotations:  1,
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++	defer cancel()
++	res, err := Run(ctx, opts)
++	if err != nil {
++		t.Fatalf("Run: %v", err)
++	}
++	if res.ToolCalls > 12 {
++		t.Errorf("ToolCalls = %d: the configured stall limits (2 turns, 1 rotation) did not bound the run", res.ToolCalls)
++	}
++	if !prov.sawPrompt("Final turn: report what you verified") {
++		t.Fatalf("a stall-stopped run did not get the report-only turn (%d prompts seen)", prov.promptCount())
++	}
++	// The report-only turn recovers evidence by reading — unproductive to the
++	// stall detector. It must survive that, or the rescue reports nothing
++	// (observed live: the turn was killed after a single read).
++	if got := strings.Count(toolLog.String(), "[autopilot] no productive tool call across"); got != 1 {
++		t.Errorf("stall guard fired %d times; the report-only turn must not be stall-killed:\n%s",
++			got, toolLog.String())
++	}
++}
+diff --git a/pkg/olium/autopilot/halt.go b/pkg/olium/autopilot/halt.go
+index 8ec2d8cb..e0fd71f7 100644
+--- a/pkg/olium/autopilot/halt.go
++++ b/pkg/olium/autopilot/halt.go
+@@ -25,6 +25,15 @@ const (
+ 	HaltSourceModel
+ 	// HaltSourceBudget was set by the outer loop's wall-time or token cap.
+ 	HaltSourceBudget
++	// HaltSourceStall was set by the durable-autopilot stall guard after the
++	// operator produced no productive tool call across several consecutive
++	// sections. Unlike a budget stop none of the run's caps are spent, which
++	// is what lets the loop still afford a bounded report-only turn.
++	HaltSourceStall
++	// HaltSourceReport was set by the outer loop when the report-only turn
++	// finished its section budget: the run is over and no re-entry — report or
++	// coverage — should try again.
++	HaltSourceReport
+ )
+ 
+ // HaltSignal is a thread-safe halt flag shared between the halt_scan tool
+@@ -66,6 +75,20 @@ func (h *HaltSignal) SetByBudget(reason string) {
+ 	h.set(reason, HaltSourceBudget)
+ }
+ 
++// SetByStall marks the signal as halted on behalf of the durable-autopilot
++// stall guard. Same idempotency contract as SetByModel. Kept distinct from
++// SetByBudget so the outer loop can tell a stopped run (caps unspent, a
++// report-only turn is still affordable) from a spent one.
++func (h *HaltSignal) SetByStall(reason string) {
++	h.set(reason, HaltSourceStall)
++}
++
++// SetByReport marks the signal as halted because the report-only turn is done.
++// Same idempotency contract as SetByModel.
++func (h *HaltSignal) SetByReport(reason string) {
++	h.set(reason, HaltSourceReport)
++}
++
+ func (h *HaltSignal) set(reason string, src HaltSource) {
+ 	h.mu.Lock()
+ 	defer h.mu.Unlock()
+diff --git a/pkg/olium/autopilot/section.go b/pkg/olium/autopilot/section.go
+index f3ba1e86..6c1ba27f 100644
+--- a/pkg/olium/autopilot/section.go
++++ b/pkg/olium/autopilot/section.go
+@@ -76,6 +76,13 @@ type SectionController struct {
+ 	MaxStallRotations   int   // 0 = disabled; consecutive stall rotations before halting
+ 	ContextTokenSoftCap int64 // 0 = disabled; caller passes a fraction of the model ceiling
+ 
++	// SuppressStalls disables the stall trigger (turns without a productive
++	// tool call) while leaving the turn and token caps in force. The outer loop
++	// sets it for the report-only turn: recovering evidence from the run
++	// transcript looks unproductive to the detector, and cutting that turn off
++	// before it can report defeats its whole purpose.
++	SuppressStalls bool
++
+ 	seq          int
+ 	current      *sectionState
+ 	stallCounter int
+@@ -188,6 +195,16 @@ func (c *SectionController) BeginSection(ctx context.Context, task, kind string)
+ //
+ // Call once per completed turn (at EventTurnDone).
+ func (c *SectionController) ShouldRotate(turnsThisSection int, tokensThisSection int64, progressed bool) (bool, string) {
++	if c.SuppressStalls {
++		// Report-only section: bounded by the turn and token caps alone.
++		if c.MaxTurnsPerSection > 0 && turnsThisSection >= c.MaxTurnsPerSection {
++			return true, rotationReasonTurnCap
++		}
++		if c.ContextTokenSoftCap > 0 && tokensThisSection >= c.ContextTokenSoftCap {
++			return true, rotationReasonTokenCap
++		}
++		return false, ""
++	}
+ 	if progressed {
+ 		c.stallCounter = 0
+ 		c.stallRotations = 0
+@@ -209,11 +226,27 @@ func (c *SectionController) ShouldRotate(turnsThisSection int, tokensThisSection
+ 
+ // StalledOut reports whether the run has rotated on a stall
+ // MaxStallRotations times with no productive turn in between, meaning a
+-// fresh section is not going to help and the run should halt.
++// fresh section is not going to help and the run should halt. Always false
++// once SuppressStalls is set (a later turn-cap rotation must not be mistaken
++// for the stall streak that already stopped the run once).
+ func (c *SectionController) StalledOut() bool {
++	if c.SuppressStalls {
++		return false
++	}
+ 	return c.MaxStallRotations > 0 && c.stallRotations >= c.MaxStallRotations
+ }
+ 
++// SuppressStallGuard disables the stall trigger for the rest of the run and
++// clears the accumulated stall state. Used by the outer loop for the
++// report-only turn, whose recovery reads (transcript, scratchpad) look
++// unproductive to the progress detector: without this the guard killed the
++// rescue turn before it could report, which is the whole point of the turn.
++func (c *SectionController) SuppressStallGuard() {
++	c.SuppressStalls = true
++	c.stallCounter = 0
++	c.stallRotations = 0
++}
++
+ // EndSection closes the current section: updates the row (status, rotation
+ // reason, closing summary, turn/token counts, ended_at) and emits section_end.
+ // Safe to call with no open section (no-op).
+diff --git a/pkg/olium/vigtool/auth_session.go b/pkg/olium/vigtool/auth_session.go
+index 3cb08706..320a7dc0 100644
+--- a/pkg/olium/vigtool/auth_session.go
++++ b/pkg/olium/vigtool/auth_session.go
+@@ -70,6 +70,16 @@ func (a *authSessionLookupTool) Execute(ctx context.Context, args map[string]any
+ 		}, nil
+ 	}
+ 	if len(rows) == 0 {
++		// Nothing at this hostname. Name what IS configured project-wide so the
++		// caller can retry against the real host instead of guessing names.
++		if all, listErr := a.ctx.Repo.GetAuthenticationHostnamesByProject(ctx, a.ctx.ProjectUUID); listErr == nil && len(all) > 0 {
++			return tool.Result{
++				Content: fmt.Sprintf("auth_session_lookup: no auth session for %s; available: %s",
++					hostname, joinSessionNamesWithHost(all)),
++				Details: map[string]any{"hostname": hostname, "matches": 0},
++				IsError: true,
++			}, nil
++		}
+ 		return tool.Result{
+ 			Content: fmt.Sprintf(`{"hostname":%q,"sessions":[]}`, hostname),
+ 			Details: map[string]any{"hostname": hostname, "matches": 0},
+@@ -85,9 +95,17 @@ func (a *authSessionLookupTool) Execute(ctx context.Context, args map[string]any
+ 			}
+ 		}
+ 		if picked == nil {
++			// A wrong name is the most common miss: state the real names (and,
++			// for sessions that live elsewhere, their hosts) so the model stops
++			// probing names that were never configured.
++			available := joinSessionNames(rows)
++			if all, listErr := a.ctx.Repo.GetAuthenticationHostnamesByProject(ctx, a.ctx.ProjectUUID); listErr == nil {
++				if others := sessionsForOtherHostnames(all, hostname); len(others) > 0 {
++					available += "; also configured: " + joinSessionNamesWithHost(others)
++				}
++			}
+ 			return tool.Result{
+-				Content: fmt.Sprintf("auth_session_lookup: no session %q registered for %s. Available: %s",
+-					name, hostname, joinSessionNames(rows)),
++				Content: fmt.Sprintf("auth_session_lookup: no session named %q; available: %s", name, available),
+ 				IsError: true,
+ 			}, nil
+ 		}
+@@ -233,3 +251,24 @@ func joinSessionNames(rows []*database.AuthenticationHostname) string {
+ 	}
+ 	return strings.Join(names, ", ")
+ }
++
++// joinSessionNamesWithHost renders each session as `name@hostname` so a caller
++// that probed the wrong host can see where the session it wanted actually is.
++func joinSessionNamesWithHost(rows []*database.AuthenticationHostname) string {
++	names := make([]string, 0, len(rows))
++	for _, r := range rows {
++		names = append(names, fmt.Sprintf("%s@%s", r.SessionName, r.Hostname))
++	}
++	return strings.Join(names, ", ")
++}
++
++// sessionsForOtherHostnames returns the rows that are not registered for host.
++func sessionsForOtherHostnames(rows []*database.AuthenticationHostname, host string) []*database.AuthenticationHostname {
++	out := make([]*database.AuthenticationHostname, 0, len(rows))
++	for _, r := range rows {
++		if r.Hostname != host {
++			out = append(out, r)
++		}
++	}
++	return out
++}
+diff --git a/pkg/olium/vigtool/auth_session_test.go b/pkg/olium/vigtool/auth_session_test.go
+index d6d7deab..9fd35060 100644
+--- a/pkg/olium/vigtool/auth_session_test.go
++++ b/pkg/olium/vigtool/auth_session_test.go
+@@ -91,3 +91,66 @@ func TestAuthToolMetadata(t *testing.T) {
+ 		}
+ 	}
+ }
++
++// saveSessionHostnames writes the session rows a prepared auth state would
++// carry (two API sessions at one host), so the lookup tool has something
++// concrete to advertise on a miss.
++func saveSessionHostnames(t *testing.T, repo *database.Repository, projectUUID string) {
++	t.Helper()
++	rows := []*database.AuthenticationHostname{
++		{ProjectUUID: projectUUID, Hostname: "app.example.com", SessionName: "admin_api", SessionRole: "compare",
++			Headers: map[string]string{"Authorization": "Basic YWRtaW4="}},
++		{ProjectUUID: projectUUID, Hostname: "app.example.com", SessionName: "lowpriv_api", SessionRole: "compare",
++			Headers: map[string]string{"Authorization": "Basic bG93"}},
++	}
++	if err := repo.SaveAuthenticationHostnames(context.Background(), rows); err != nil {
++		t.Fatalf("SaveAuthenticationHostnames: %v", err)
++	}
++}
++
++// TestAuthSessionLookupUnknownNameListsConfiguredSessions locks the fix for the
++// operator that spent its run calling auth_session_lookup with `admin_backend`:
++// a wrong name must answer with the names that actually exist.
++func TestAuthSessionLookupUnknownNameListsConfiguredSessions(t *testing.T) {
++	repo := newVigtoolTestRepo(t)
++	ctx := context.Background()
++	project := database.DefaultProjectUUID
++	saveSessionHostnames(t, repo, project)
++
++	tool := NewAuthSessionLookupTool(&SessionsContext{Repo: repo, ProjectUUID: project})
++	res, err := tool.Execute(ctx, map[string]any{"hostname": "app.example.com", "name": "admin_backend"}, nil)
++	if err != nil {
++		t.Fatalf("Execute: %v", err)
++	}
++	if !res.IsError {
++		t.Fatalf("a wrong session name must error, got %q", res.Content)
++	}
++	const want = `auth_session_lookup: no session named "admin_backend"; available: admin_api, lowpriv_api`
++	if res.Content != want {
++		t.Errorf("Content = %q, want %q", res.Content, want)
++	}
++}
++
++// TestAuthSessionLookupUnknownHostnameListsProjectSessions covers the other
++// guessing mode — probing a host that has no sessions — where the answer has to
++// include the host so the caller can retry in the right place.
++func TestAuthSessionLookupUnknownHostnameListsProjectSessions(t *testing.T) {
++	repo := newVigtoolTestRepo(t)
++	ctx := context.Background()
++	project := database.DefaultProjectUUID
++	saveSessionHostnames(t, repo, project)
++
++	tool := NewAuthSessionLookupTool(&SessionsContext{Repo: repo, ProjectUUID: project})
++	res, err := tool.Execute(ctx, map[string]any{"hostname": "other.example.com"}, nil)
++	if err != nil {
++		t.Fatalf("Execute: %v", err)
++	}
++	if !res.IsError {
++		t.Fatalf("an unknown hostname with project sessions must error, got %q", res.Content)
++	}
++	const want = "auth_session_lookup: no auth session for other.example.com; available: " +
++		"admin_api@app.example.com, lowpriv_api@app.example.com"
++	if res.Content != want {
++		t.Errorf("Content = %q, want %q", res.Content, want)
++	}
++}
+diff --git a/pkg/server/handlers_agent_autopilot.go b/pkg/server/handlers_agent_autopilot.go
+index 5bf29516..1bb07878 100644
+--- a/pkg/server/handlers_agent_autopilot.go
++++ b/pkg/server/handlers_agent_autopilot.go
+@@ -287,6 +287,9 @@ func (h *Handlers) buildAutopilotPipelineConfig(req AgentAutopilotRequest, proje
+ 		Focus:                 req.Focus,
+ 		AgentName:             h.effectiveAgentName(req.Agent),
+ 		MaxCommands:           maxCmds,
++		SectionMaxTurns:       h.settings.Agent.Olium.SectionMaxTurns,
++		StallTurns:            h.settings.Agent.Olium.StallTurns,
++		StallRotations:        h.settings.Agent.Olium.StallRotations,
+ 		DryRun:                req.DryRun,
+ 		Triage:                req.Triage,
+ 		SessionsDir:           h.settings.Agent.EffectiveSessionsDir(),
+-- 
+2.56.0
+
