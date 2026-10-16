@@ -1,0 +1,43 @@
+From 9b6a26c8295c9150569130c4f235ed4f55a83fcc Mon Sep 17 00:00:00 2001
+From: Wolfram Huesken <woh@m18.io>
+Date: Fri, 16 Oct 2026 18:39:11 +0200
+Subject: [PATCH 8/9] chore(local): use 'git co' instead of 'git switch'
+
+---
+ justfile | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/justfile b/justfile
+index ea70d916..fbac540e 100644
+--- a/justfile
++++ b/justfile
+@@ -37,7 +37,7 @@ sync:
+ 
+ # make main a pristine copy of upstream again (drops local commits on main)
+ reset-main:
+-    git switch main
++    git co main
+     git reset --hard {{upstream}}/main
+     @echo "main == upstream/main. Publish with: git push --force-with-lease origin main"
+ 
+@@ -46,7 +46,7 @@ rebase: _clean
+     #!/usr/bin/env bash
+     set -euo pipefail
+     base=$(git describe --tags --abbrev=0 "{{upstream}}/main")
+-    git switch "{{stack}}"
++    git co "{{stack}}"
+     git rebase "$base"
+     echo "stack rebased onto $base"
+ 
+@@ -140,7 +140,7 @@ publish:
+ 
+ # start a PR-sized branch off upstream with one commit cherry-picked from the stack
+ pr-branch name commit: _clean
+-    git switch -c {{name}} {{upstream}}/main
++    git co -b {{name}} {{upstream}}/main
+     git cherry-pick {{commit}}
+     @echo "review, then: just pr-push {{name}}"
+ 
+-- 
+2.56.0
+

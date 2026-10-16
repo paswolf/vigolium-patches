@@ -1,7 +1,7 @@
 From ce8fcf20af737006ab856e72ebe8227fe9ee9001 Mon Sep 17 00:00:00 2001
 From: Wolfram Huesken <woh@m18.io>
 Date: Wed, 14 Oct 2026 08:47:33 +0200
-Subject: [PATCH 2/5] Fixed some weird behaviour causing the scan to degrade
+Subject: [PATCH 2/9] Fixed some weird behaviour causing the scan to degrade
 
 ---
  CHANGELOG.md                                  |  14 ++
