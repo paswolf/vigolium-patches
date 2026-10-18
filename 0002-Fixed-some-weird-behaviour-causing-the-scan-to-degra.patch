@@ -1,10 +1,9 @@
-From ce8fcf20af737006ab856e72ebe8227fe9ee9001 Mon Sep 17 00:00:00 2001
+From 228b3e319813be47cc7af4dd8c4b799f0f2b8841 Mon Sep 17 00:00:00 2001
 From: Wolfram Huesken <woh@m18.io>
 Date: Wed, 14 Oct 2026 08:47:33 +0200
-Subject: [PATCH 02/11] Fixed some weird behaviour causing the scan to degrade
+Subject: [PATCH 02/10] Fixed some weird behaviour causing the scan to degrade
 
 ---
- CHANGELOG.md                                  |  14 ++
  docs/agentic-scan/autopilot.md                |  60 +++++
  internal/config/agent.go                      |  25 +++
  internal/config/agent_test.go                 |   1 +
@@ -28,37 +27,12 @@ Subject: [PATCH 02/11] Fixed some weird behaviour causing the scan to degrade
  pkg/olium/vigtool/auth_session.go             |  43 +++-
  pkg/olium/vigtool/auth_session_test.go        |  63 ++++++
  pkg/server/handlers_agent_autopilot.go        |   3 +
- 24 files changed, 1635 insertions(+), 37 deletions(-)
+ 23 files changed, 1621 insertions(+), 37 deletions(-)
  create mode 100644 pkg/agent/autopilot_artifact_synthesis_test.go
  create mode 100644 pkg/agent/autopilot_auth_warning_test.go
  create mode 100644 pkg/agent/triage_writeback_test.go
  create mode 100644 pkg/olium/autopilot/final_report_test.go
 
-diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 437d34bb..590a7b8d 100644
---- a/CHANGELOG.md
-+++ b/CHANGELOG.md
-@@ -2,6 +2,20 @@
- 
- All notable changes to this project will be documented in this file.
- 
-+## [Unreleased]
-+
-+### Added
-+
-+- `agent.olium.section_max_turns` / `agent.olium.stall_turns` / `agent.olium.stall_rotations` tune the durable-autopilot section budgets (defaults 40 / 12 / 3) instead of pinning them to package constants.
-+- Autopilot grants a *stopped* run one report-only turn. When the stall guard stops a run, or the engine gives up on its own, and nothing was reported, the loop re-enters once with a reset context, a mission that points at the run transcript and requires the finding tool for everything verified, plus the `findings.json` / `dismissed.json` artifacts. The turn is exempt from the stall guard (recovering evidence by reading looks unproductive to it) and ends the run when it reaches its section limit. Opt out with `Options.NoFinalReportTurn`.
-+
-+### Fixed
-+
-+- Autopilot triage wrote its verdicts scoped to the run's own UUID, so findings imported by a child audit run stayed `draft` — unreachable by `vigolium finding --verdict confirmed,triaged` and absent from reports. The same scope also never matched rows stored without any run UUID (pre-scan and passive findings), so their verdicts were dropped silently while the rows kept the scanner's status. The write-back now spans the run, its child runs, and unattributed rows — rows owned by a *different* run are still left alone.
-+- `findings.json` / `dismissed.json` were a model obligation: when the operator did not write them the run warned "artifact missing" even though the findings were in the database. They are now synthesized from the DB once verify-before-promote and triage have finished, so the artifact reflects the run's judged findings; operator-authored files still win.
-+- An invalid discovered auth session produced only "some discovered auth sessions were invalid and could not be repaired" — no names, no reasons — which sent the operator hunting for sessions that do not exist. The warning now names the dropped entries, their validation errors and the usable sessions; the repair failure is logged with its cause; and `auth_session_lookup` on an unknown name lists the configured sessions.
-+- `--project-name` that names no project was silently ignored on the autopilot and agent-query paths: the run wrote its findings into the Default Project and the post-run triage failed for want of a project UUID, with nothing in the log explaining why. Resolution errors are now propagated (`cannot scope this run to a project: ...`) instead of being discarded.
-+
- ## [v0.5.3] - 2026-10-10
- 
- ### Added
 diff --git a/docs/agentic-scan/autopilot.md b/docs/agentic-scan/autopilot.md
 index 00c2648e..aed99d94 100644
 --- a/docs/agentic-scan/autopilot.md

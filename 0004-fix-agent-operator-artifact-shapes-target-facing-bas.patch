@@ -1,7 +1,7 @@
-From 72cec3f5a2708c3b01549b894c2b555caf5ec131 Mon Sep 17 00:00:00 2001
+From 0075777c775b10ee0fe527d735ab7d8446ea9dc7 Mon Sep 17 00:00:00 2001
 From: Wolfram Huesken <woh@m18.io>
 Date: Thu, 15 Oct 2026 09:13:26 +0200
-Subject: [PATCH 04/11] fix(agent): operator artifact shapes, target-facing
+Subject: [PATCH 04/10] fix(agent): operator artifact shapes, target-facing
  bash progress, honest run labels
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -58,7 +58,6 @@ Then: make test-unit && make build, and apply the config-side settings from the
 guide. Verify a patch is present with the anchor greps in that guide's "Checking
 whether a newer release already has a fix" section.
 ---
- CHANGELOG.md                                  |   7 +
  docs/agentic-scan/autopilot.md                |  19 ++-
  .../local-agent-pipeline-patches.md           | 134 +++++++++++++--
  pkg/agent/autopilot_context.go                |  48 ++++--
@@ -68,28 +67,10 @@ whether a newer release already has a fix" section.
  pkg/olium/autopilot/autopilot.go              |  18 ++-
  pkg/olium/autopilot/progress_test.go          | 153 ++++++++++++++++++
  pkg/olium/autopilot/rotation.go               | 151 +++++++++++++++++
- 10 files changed, 597 insertions(+), 34 deletions(-)
+ 9 files changed, 590 insertions(+), 34 deletions(-)
  create mode 100644 pkg/cli/agent_session_label_test.go
  create mode 100644 pkg/olium/autopilot/progress_test.go
 
-diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 590a7b8d..30696fbc 100644
---- a/CHANGELOG.md
-+++ b/CHANGELOG.md
-@@ -15,6 +15,13 @@ All notable changes to this project will be documented in this file.
- - `findings.json` / `dismissed.json` were a model obligation: when the operator did not write them the run warned "artifact missing" even though the findings were in the database. They are now synthesized from the DB once verify-before-promote and triage have finished, so the artifact reflects the run's judged findings; operator-authored files still win.
- - An invalid discovered auth session produced only "some discovered auth sessions were invalid and could not be repaired" — no names, no reasons — which sent the operator hunting for sessions that do not exist. The warning now names the dropped entries, their validation errors and the usable sessions; the repair failure is logged with its cause; and `auth_session_lookup` on an unknown name lists the configured sessions.
- - `--project-name` that names no project was silently ignored on the autopilot and agent-query paths: the run wrote its findings into the Default Project and the post-run triage failed for want of a project UUID, with nothing in the log explaining why. Resolution errors are now propagated (`cannot scope this run to a project: ...`) instead of being discarded.
-+- A run that finished with warnings printed its warning list under an `✖ Error` heading in `vigolium agent session`, so a successful 7h45m run with 13 findings read as broken. The heading now follows the status (`Warnings` vs `Error`).
-+- The autopilot artifact check counted a finding as evidence-free unless it inlined a request/response body, so findings that cite linked HTTP records — the common shape — were reported as unsupported. Non-empty `http_record_uuids` / `evidence_record_uuids` now count as evidence references.
-+- A `bash` turn that reaches the target with an HTTP client (`curl`, `wget`, `httpie`, `httpx`, `hurl`, `ncat`, `netcat`)
-+  and names the run's target or a scope host now counts as progress for the autopilot stall detector, so shell-driven
-+  probing — replaying a request, reusing a harvested session cookie — no longer reads as a stall and no longer stops
-+  the run. Source reads, URL greps and `docker exec` database queries still count as no progress.
-+- The autopilot artifact check rejected `dismissed.json` written as a flat array of strings — the shape the operator actually produces — and reported a complete run as degraded with `failed to parse dismissed.json as findings artifact`. Artifact entries may now be any JSON value: string entries count where no evidence check applies (the dismissed artifact) and are still flagged as evidence-free in `findings.json`.
- 
- ## [v0.5.3] - 2026-10-10
- 
 diff --git a/docs/agentic-scan/autopilot.md b/docs/agentic-scan/autopilot.md
 index aed99d94..2271c1dd 100644
 --- a/docs/agentic-scan/autopilot.md

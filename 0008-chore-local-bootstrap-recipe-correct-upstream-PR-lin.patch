@@ -1,7 +1,7 @@
-From 5ef4e2fbefba416cd0c3ee36ae7841b015a49320 Mon Sep 17 00:00:00 2001
+From 118a11604e37f293bdcc44806b991779d0ad01f0 Mon Sep 17 00:00:00 2001
 From: Wolfram Huesken <woh@m18.io>
 Date: Fri, 16 Oct 2026 18:47:59 +0200
-Subject: [PATCH 09/11] chore(local): bootstrap recipe, correct upstream PR
+Subject: [PATCH 08/10] chore(local): bootstrap recipe, correct upstream PR
  link
 
 ---

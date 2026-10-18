@@ -1,7 +1,7 @@
-From 82a92a929086e7be8eba65de35f8e97bf7c4a1d4 Mon Sep 17 00:00:00 2001
+From b049b075a3e00c2f8e7c3bfc8ed91234fff7b57c Mon Sep 17 00:00:00 2001
 From: Wolfram Huesken <woh@m18.io>
 Date: Tue, 13 Oct 2026 15:55:28 +0200
-Subject: [PATCH 01/11] fix(agent): apply agent.olium.max_turns to
+Subject: [PATCH 01/10] fix(agent): apply agent.olium.max_turns to
  non-autopilot engine runs
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -160,7 +160,7 @@ index 26fbf289..9e8391b4 100644
  		// Skills, when set, are rendered into the system prompt as an
  		// <available_skills> block by engine.New. The load_skill tool that
 
-base-commit: 6bd0897010bbd75a983ec760cff29e4c366b49ef
+base-commit: e6100d4d37b8db624b9d03360e416f3cc4c25077
 -- 
 2.56.0
 
