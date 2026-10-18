@@ -1,7 +1,7 @@
 From 0075777c775b10ee0fe527d735ab7d8446ea9dc7 Mon Sep 17 00:00:00 2001
 From: Wolfram Huesken <woh@m18.io>
 Date: Thu, 15 Oct 2026 09:13:26 +0200
-Subject: [PATCH 04/10] fix(agent): operator artifact shapes, target-facing
+Subject: [PATCH 04/11] fix(agent): operator artifact shapes, target-facing
  bash progress, honest run labels
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
