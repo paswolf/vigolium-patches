@@ -1,7 +1,7 @@
 From b049b075a3e00c2f8e7c3bfc8ed91234fff7b57c Mon Sep 17 00:00:00 2001
 From: Wolfram Huesken <woh@m18.io>
 Date: Tue, 13 Oct 2026 15:55:28 +0200
-Subject: [PATCH 01/12] fix(agent): apply agent.olium.max_turns to
+Subject: [PATCH 01/13] fix(agent): apply agent.olium.max_turns to
  non-autopilot engine runs
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

@@ -1,7 +1,7 @@
 From 989972e391d17a7483e1c7f1b0a49c50cb3d1953 Mon Sep 17 00:00:00 2001
 From: Wolfram Huesken <woh@m18.io>
 Date: Wed, 14 Oct 2026 11:17:31 +0200
-Subject: [PATCH 03/12] test(agent): lock the pipeline fixes and document
+Subject: [PATCH 03/13] test(agent): lock the pipeline fixes and document
  reapplying them
 
 ---

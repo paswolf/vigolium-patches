@@ -1,0 +1,26 @@
+From 68fd1860ff6d308e4434f3cf5a01dc0ab7f6e621 Mon Sep 17 00:00:00 2001
+From: Wolfram Huesken <woh@m18.io>
+Date: Sun, 18 Oct 2026 21:17:04 +0200
+Subject: [PATCH 13/13] fix(cli): wrap the burp-bridge project-resolution error
+ as a usage error
+
+---
+ pkg/cli/agent_autopilot.go | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/pkg/cli/agent_autopilot.go b/pkg/cli/agent_autopilot.go
+index 20b2ae20..77456dbe 100644
+--- a/pkg/cli/agent_autopilot.go
++++ b/pkg/cli/agent_autopilot.go
+@@ -424,7 +424,7 @@ func runAgentAutopilot(cmd *cobra.Command, args []string) (err error) {
+ 		}
+ 		projectUUID, projectErr := resolveProjectUUID()
+ 		if projectErr != nil {
+-			return fmt.Errorf("--burp-bridge-url: cannot resolve project: %w", projectErr)
++			return usageErrorf("--burp-bridge-url: cannot resolve project: %w", projectErr)
+ 		}
+ 		fmt.Fprintf(os.Stderr, "%s Importing live bridge traffic from %s ...\n",
+ 			terminal.InfoSymbol(), terminal.Cyan(validated))
+-- 
+2.56.0
+
