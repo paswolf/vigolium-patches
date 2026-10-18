@@ -1,7 +1,7 @@
 From 29fb038b363718cf813a183d6862d608a55fb8f8 Mon Sep 17 00:00:00 2001
 From: Wolfram Huesken <woh@m18.io>
 Date: Sun, 18 Oct 2026 20:37:39 +0200
-Subject: [PATCH 11/11] chore(local): own changelog and root upgrade guide;
+Subject: [PATCH 11/12] chore(local): own changelog and root upgrade guide;
  keep upstream CHANGELOG untouched
 
 ---

@@ -1,0 +1,37 @@
+From 8384aa719e72200317133314c3939b180135ac0e Mon Sep 17 00:00:00 2001
+From: Wolfram Huesken <woh@m18.io>
+Date: Sun, 18 Oct 2026 20:41:48 +0200
+Subject: [PATCH 12/12] docs(local): actions stays disabled; workflows belong
+ to upstream
+
+---
+ UPGRADE_PASWOLF.md | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/UPGRADE_PASWOLF.md b/UPGRADE_PASWOLF.md
+index 76080048..fefcf90d 100644
+--- a/UPGRADE_PASWOLF.md
++++ b/UPGRADE_PASWOLF.md
+@@ -103,7 +103,6 @@ Conflict hotspots (the per-patch sections carry the invariants to preserve):
+ | `pkg/agent/autopilot_pipeline.go` | pipeline tail ordering (artifacts after triage) |
+ | `pkg/agent/triage.go`, `pkg/database/repository_findings.go` | write-back scope |
+ | `internal/config/agent.go` | new `OliumConfig` fields and defaults |
+-| `.github/workflows/*` | only if a local CI tweak is still carried; CI config changes are not worth a patch |
+ 
+ Then confirm nothing vanished by accident:
+ 
+@@ -164,6 +163,11 @@ semantics. Keep step 0 around it, and run `just push` / `just publish` after.
+   diverge from the fork's branch; `just push` uses `--force-with-lease`, which
+   refuses if someone else moved the branch in the meantime. Never `--force`
+   bare.
++- **GitHub Actions is disabled on the fork** (Settings → Actions → General →
++  "Disable actions"), and no workflow file is patched: the CI-dispatch commit
++  that used to gate them is not carried. Workflows belong to upstream — do not
++  re-enable Actions and do not edit `.github/workflows/*`. There are no repo
++  secrets, and none should be added.
+ - **Never use GitHub's "Sync fork" button.** The fork's default branch is the
+   patched one; its discard option force-resets it to upstream.
+ - **Never merge origin into `local/stable`.** That fuses the old stack into the
+-- 
+2.56.0
+
