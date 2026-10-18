@@ -1,7 +1,7 @@
 From fbd8061fcd70dcdb9af802cd69085ee4efbce675 Mon Sep 17 00:00:00 2001
 From: j3ssie <j3ssiejjj@gmail.com>
 Date: Sat, 10 Oct 2026 21:57:36 +0800
-Subject: [PATCH 7/9] ci: run the CI workflow only on manual dispatch
+Subject: [PATCH 07/11] ci: run the CI workflow only on manual dispatch
 
 The full suite is long, so pushes, pull requests and the nightly schedule no
 longer trigger it. Start it from the Actions tab or `gh workflow run ci.yml`;

@@ -1,8 +1,8 @@
 From 72cec3f5a2708c3b01549b894c2b555caf5ec131 Mon Sep 17 00:00:00 2001
 From: Wolfram Huesken <woh@m18.io>
 Date: Thu, 15 Oct 2026 09:13:26 +0200
-Subject: [PATCH 4/9] fix(agent): operator artifact shapes, target-facing bash
- progress, honest run labels
+Subject: [PATCH 04/11] fix(agent): operator artifact shapes, target-facing
+ bash progress, honest run labels
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

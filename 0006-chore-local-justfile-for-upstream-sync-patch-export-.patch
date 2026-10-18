@@ -1,7 +1,7 @@
 From 5706aa913f25403261cac63bac18cf77d080bc91 Mon Sep 17 00:00:00 2001
 From: Wolfram Huesken <woh@m18.io>
 Date: Fri, 16 Oct 2026 18:20:07 +0200
-Subject: [PATCH 6/9] chore(local): justfile for upstream sync, patch export
+Subject: [PATCH 06/11] chore(local): justfile for upstream sync, patch export
  and PR prep
 
 ---

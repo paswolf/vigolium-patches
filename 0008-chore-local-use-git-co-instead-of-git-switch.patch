@@ -1,7 +1,7 @@
 From 9b6a26c8295c9150569130c4f235ed4f55a83fcc Mon Sep 17 00:00:00 2001
 From: Wolfram Huesken <woh@m18.io>
 Date: Fri, 16 Oct 2026 18:39:11 +0200
-Subject: [PATCH 8/9] chore(local): use 'git co' instead of 'git switch'
+Subject: [PATCH 08/11] chore(local): use 'git co' instead of 'git switch'
 
 ---
  justfile | 6 +++---

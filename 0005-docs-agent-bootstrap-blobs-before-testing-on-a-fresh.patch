@@ -1,7 +1,7 @@
 From df2eb5dcfe7b20e9961cc228b3b79b42a1c0d036 Mon Sep 17 00:00:00 2001
 From: Wolfram Huesken <woh@m18.io>
 Date: Thu, 15 Oct 2026 09:15:24 +0200
-Subject: [PATCH 5/9] docs(agent): bootstrap blobs before testing on a fresh
+Subject: [PATCH 05/11] docs(agent): bootstrap blobs before testing on a fresh
  clone
 
 Rehearsing the patch bundle in a clean worktree at 82a92a92 showed the guide's
