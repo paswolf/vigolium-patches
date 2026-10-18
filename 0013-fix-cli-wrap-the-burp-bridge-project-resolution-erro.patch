@@ -1,7 +1,7 @@
 From 68fd1860ff6d308e4434f3cf5a01dc0ab7f6e621 Mon Sep 17 00:00:00 2001
 From: Wolfram Huesken <woh@m18.io>
 Date: Sun, 18 Oct 2026 21:17:04 +0200
-Subject: [PATCH 13/13] fix(cli): wrap the burp-bridge project-resolution error
+Subject: [PATCH 13/14] fix(cli): wrap the burp-bridge project-resolution error
  as a usage error
 
 ---

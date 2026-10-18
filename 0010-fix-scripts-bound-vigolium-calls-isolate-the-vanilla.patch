@@ -1,7 +1,7 @@
 From 3ee495cba917319a0120907ca866e6788d5220c5 Mon Sep 17 00:00:00 2001
 From: Wolfram Huesken <woh@m18.io>
 Date: Fri, 16 Oct 2026 19:12:35 +0200
-Subject: [PATCH 10/13] fix(scripts): bound vigolium calls, isolate the vanilla
+Subject: [PATCH 10/14] fix(scripts): bound vigolium calls, isolate the vanilla
  HOME
 
 ---

@@ -1,7 +1,7 @@
 From 8384aa719e72200317133314c3939b180135ac0e Mon Sep 17 00:00:00 2001
 From: Wolfram Huesken <woh@m18.io>
 Date: Sun, 18 Oct 2026 20:41:48 +0200
-Subject: [PATCH 12/13] docs(local): actions stays disabled; workflows belong
+Subject: [PATCH 12/14] docs(local): actions stays disabled; workflows belong
  to upstream
 
 ---
