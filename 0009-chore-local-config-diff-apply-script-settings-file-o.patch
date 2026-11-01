@@ -1,4 +1,4 @@
-From 991ec5cc73dedff6ce7ee3abfcf47277ecab39ec Mon Sep 17 00:00:00 2001
+From f73b091533542b6532cbcbfaf2a84d060880aff4 Mon Sep 17 00:00:00 2001
 From: Wolfram Huesken <woh@m18.io>
 Date: Fri, 16 Oct 2026 19:05:10 +0200
 Subject: [PATCH 09/14] chore(local): config diff/apply script, settings file,

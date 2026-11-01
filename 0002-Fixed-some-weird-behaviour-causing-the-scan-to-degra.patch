@@ -1,4 +1,4 @@
-From 228b3e319813be47cc7af4dd8c4b799f0f2b8841 Mon Sep 17 00:00:00 2001
+From b8f6b66e373731177ff7384abc526d7c73663522 Mon Sep 17 00:00:00 2001
 From: Wolfram Huesken <woh@m18.io>
 Date: Wed, 14 Oct 2026 08:47:33 +0200
 Subject: [PATCH 02/14] Fixed some weird behaviour causing the scan to degrade
@@ -1246,7 +1246,7 @@ index c9de6c3b..36afe7dd 100644
  	if !agentDryRun {
  		_, model := settings.Agent.BackendMeta()
 diff --git a/pkg/cli/agent_autopilot.go b/pkg/cli/agent_autopilot.go
-index 46bdda77..20b2ae20 100644
+index 425405df..e0548b21 100644
 --- a/pkg/cli/agent_autopilot.go
 +++ b/pkg/cli/agent_autopilot.go
 @@ -422,7 +422,10 @@ func runAgentAutopilot(cmd *cobra.Command, args []string) (err error) {
@@ -1261,7 +1261,7 @@ index 46bdda77..20b2ae20 100644
  		fmt.Fprintf(os.Stderr, "%s Importing live bridge traffic from %s ...\n",
  			terminal.InfoSymbol(), terminal.Cyan(validated))
  		res, ierr := importBurpTrafficToDB(context.Background(), repo, validated,
-@@ -511,7 +514,10 @@ func runAgentAutopilot(cmd *cobra.Command, args []string) (err error) {
+@@ -521,7 +524,10 @@ func runAgentAutopilot(cmd *cobra.Command, args []string) (err error) {
  		// Pass the active project so --project-uuid (or --project-name) can
  		// override the project component parsed from the gs:// URI, matching
  		// audit/swarm/scan behavior.
@@ -1274,7 +1274,7 @@ index 46bdda77..20b2ae20 100644
  		if gcsErr != nil {
  			return fmt.Errorf("failed to resolve gs:// source: %w", gcsErr)
 diff --git a/pkg/cli/agent_autopilot_olium.go b/pkg/cli/agent_autopilot_olium.go
-index 6ae9529c..d51cf02f 100644
+index 92bec1a4..874b24cc 100644
 --- a/pkg/cli/agent_autopilot_olium.go
 +++ b/pkg/cli/agent_autopilot_olium.go
 @@ -112,7 +112,14 @@ func runAutopilotOlium(parentCtx context.Context, settings *config.Settings, rep
@@ -1401,7 +1401,7 @@ index 5cd93e41..62ae0f0e 100644
  // writer scoped to project A cannot flip project B's finding by raw id or by a
  // finding_hash both projects share.
 diff --git a/pkg/database/repository_findings.go b/pkg/database/repository_findings.go
-index c8a25731..6738e9c3 100644
+index b601b2dd..ba9cce3b 100644
 --- a/pkg/database/repository_findings.go
 +++ b/pkg/database/repository_findings.go
 @@ -535,6 +535,55 @@ func (r *Repository) UpdateFindingStatusByHash(ctx context.Context, projectUUID,
@@ -1931,7 +1931,7 @@ index 8ec2d8cb..e0fd71f7 100644
  	h.mu.Lock()
  	defer h.mu.Unlock()
 diff --git a/pkg/olium/autopilot/section.go b/pkg/olium/autopilot/section.go
-index f3ba1e86..6c1ba27f 100644
+index b380fcc4..4787fc04 100644
 --- a/pkg/olium/autopilot/section.go
 +++ b/pkg/olium/autopilot/section.go
 @@ -76,6 +76,13 @@ type SectionController struct {

@@ -1,4 +1,4 @@
-From b049b075a3e00c2f8e7c3bfc8ed91234fff7b57c Mon Sep 17 00:00:00 2001
+From f640812ccb20a4288d09f8c5579a0b3aec8af1ad Mon Sep 17 00:00:00 2001
 From: Wolfram Huesken <woh@m18.io>
 Date: Tue, 13 Oct 2026 15:55:28 +0200
 Subject: [PATCH 01/14] fix(agent): apply agent.olium.max_turns to
@@ -160,7 +160,7 @@ index 26fbf289..9e8391b4 100644
  		// Skills, when set, are rendered into the system prompt as an
  		// <available_skills> block by engine.New. The load_skill tool that
 
-base-commit: e6100d4d37b8db624b9d03360e416f3cc4c25077
+base-commit: 1aa203d8407cb62d2ad17f0e1b99f9b049aa767c
 -- 
 2.56.0
 
